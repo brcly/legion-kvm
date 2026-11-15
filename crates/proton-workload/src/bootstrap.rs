@@ -1621,6 +1621,10 @@ mod linux {
                                     | "LANG"
                                     | "LC_ALL"
                                     | "LEGION_WORKLOAD_DIRECTORY"
+                                    | "XDG_CACHE_HOME"
+                                    | "XDG_CONFIG_HOME"
+                                    | "XDG_DATA_HOME"
+                                    | "XDG_STATE_HOME"
                             )),
                     "unsupported forwarded game environment variable"
                 );

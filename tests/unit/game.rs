@@ -26,3 +26,66 @@ fn steam_command_keeps_selected_proton_and_game_argument_boundaries() -> Result<
     assert_eq!(r.arguments, ["one argument with spaces"]);
     Ok(())
 }
+
+fn vars(pairs: &[(&str, &str)]) -> impl Iterator<Item = (OsString, OsString)> {
+    pairs
+        .iter()
+        .map(|(key, value)| (OsString::from(key), OsString::from(value)))
+}
+
+#[test]
+fn guest_xdg_overrides_replace_the_plain_names() -> Result<()> {
+    let home = Path::new("/home/legion");
+    let forwarded = guest_xdg(
+        home,
+        vars(&[
+            (
+                "LEGION_GUEST_XDG_CONFIG_HOME",
+                "/home/legion/profile/config",
+            ),
+            ("LEGION_GUEST_XDG_DATA_HOME", "/home/legion/profile/data"),
+            ("LEGION_GUEST_XDG_STATE_HOME", "/home/legion/profile/state"),
+            ("LEGION_GUEST_XDG_CACHE_HOME", "/home/legion/profile/cache"),
+            ("XDG_CONFIG_HOME", "/tmp/ignored"),
+            ("PATH", "/usr/bin"),
+        ]),
+    )?;
+    assert_eq!(
+        forwarded,
+        [
+            (
+                "XDG_CONFIG_HOME".to_owned(),
+                "/home/legion/profile/config".to_owned()
+            ),
+            (
+                "XDG_DATA_HOME".to_owned(),
+                "/home/legion/profile/data".to_owned()
+            ),
+            (
+                "XDG_STATE_HOME".to_owned(),
+                "/home/legion/profile/state".to_owned()
+            ),
+            (
+                "XDG_CACHE_HOME".to_owned(),
+                "/home/legion/profile/cache".to_owned()
+            ),
+        ]
+    );
+    Ok(())
+}
+
+#[test]
+fn guest_xdg_rejects_paths_outside_home() {
+    let home = Path::new("/home/legion");
+    for value in [
+        "/etc/legion",
+        "/home/legion/../other",
+        "/home/legion-other/config",
+        "relative/config",
+    ] {
+        assert!(
+            guest_xdg(home, vars(&[("LEGION_GUEST_XDG_CONFIG_HOME", value)])).is_err(),
+            "{value} must be rejected"
+        );
+    }
+}

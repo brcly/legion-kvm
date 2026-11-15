@@ -185,6 +185,55 @@ fn copy(source: &Path, target: &Path) -> Result<()> {
     Ok(())
 }
 
+const GUEST_XDG_NAMES: [&str; 4] = [
+    "XDG_CACHE_HOME",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_STATE_HOME",
+];
+
+/// Rename `LEGION_GUEST_XDG_*` overrides to the plain names Wine expects.
+///
+/// Legion reads `XDG_CACHE_HOME` and `XDG_STATE_HOME` itself, for the runtime
+/// cache and the session logs. A launcher cannot reuse those names for its own
+/// profiles without duplicating the runtime for every profile, so the prefixed
+/// variables stay in the launcher process and only the unprefixed values reach
+/// the guest.
+///
+/// Values must be absolute paths below `$HOME`, the only tree Legion maps back
+/// to its original path inside the guest.
+fn guest_xdg(
+    home: &Path,
+    vars: impl Iterator<Item = (OsString, OsString)>,
+) -> Result<Vec<(String, String)>> {
+    let mut forwarded = Vec::new();
+    for (key, value) in vars {
+        let Some(name) = key
+            .to_str()
+            .and_then(|key| key.strip_prefix("LEGION_GUEST_"))
+            .filter(|name| GUEST_XDG_NAMES.contains(name))
+        else {
+            continue;
+        };
+        let path = Path::new(&value);
+        ensure!(
+            path.is_absolute()
+                && path
+                    .components()
+                    .all(|part| !matches!(part, std::path::Component::ParentDir))
+                && path.starts_with(home),
+            "LEGION_GUEST_{name} must be an absolute path inside {}: {}",
+            home.display(),
+            path.display()
+        );
+        let value = value
+            .to_str()
+            .with_context(|| format!("LEGION_GUEST_{name} must be UTF-8"))?;
+        forwarded.push((name.to_owned(), value.to_owned()));
+    }
+    Ok(forwarded)
+}
+
 pub(crate) fn run(args: &[OsString]) -> Result<()> {
     let request = parse(args)?;
     let runtime = Runtime::load(None)?;
@@ -385,7 +434,7 @@ pub(crate) fn run(args: &[OsString]) -> Result<()> {
             overrides.push_str(&format!("{name}={value}"));
         }
     }
-    let environment: BTreeMap<String, String> = std::env::vars()
+    let mut environment: BTreeMap<String, String> = std::env::vars()
         .filter(|(k, _)| {
             k.starts_with("PROTON_")
                 || k.starts_with("DXVK_")
@@ -401,6 +450,7 @@ pub(crate) fn run(args: &[OsString]) -> Result<()> {
                 )
         })
         .collect();
+    environment.extend(guest_xdg(&home, std::env::vars_os())?);
     launch["proton_path"] = serde_json::json!(request.proton);
     if amd {
         launch["vulkan_driver"] = "radv".into();
