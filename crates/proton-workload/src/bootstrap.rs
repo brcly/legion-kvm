@@ -1679,6 +1679,10 @@ mod linux {
                                     | "VN_PERF"
                                     | "VN_FEEDBACK_SPIN_US"
                                     | "LEGION_WORKLOAD_DIRECTORY"
+                                    | "XDG_CACHE_HOME"
+                                    | "XDG_CONFIG_HOME"
+                                    | "XDG_DATA_HOME"
+                                    | "XDG_STATE_HOME"
                             )),
                     "unsupported forwarded game environment variable"
                 );

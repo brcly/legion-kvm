@@ -97,6 +97,14 @@ in `vm/report.json` under `host_vulkan_environment`. Their manifests must be
 usable by Legion's 64-bit host renderer, outside any runner container.
 NVAPI/NGX integration is disabled on this path pending separate validation.
 
+`LEGION_GUEST_XDG_CACHE_HOME`, `LEGION_GUEST_XDG_CONFIG_HOME`,
+`LEGION_GUEST_XDG_DATA_HOME` and `LEGION_GUEST_XDG_STATE_HOME` forward
+per-profile directories to the application as their unprefixed equivalents.
+They must be absolute paths inside the host home directory, the only tree that
+keeps its original path inside the guest. Legion keeps reading the unprefixed
+`XDG_*` variables for its own runtime cache and session logs, so profiles do
+not duplicate the runtime.
+
 ## Building
 
 Install Python 3.11 or later and rootless Podman or an accessible Docker engine.
