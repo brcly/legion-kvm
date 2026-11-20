@@ -1,0 +1,43 @@
+--- a/src/guest/nvkvm_drm.c
++++ b/src/guest/nvkvm_drm.c
+@@ -645,21 +645,10 @@
+ 	if (r)
+ 		return r;
+ 
+-	/*
+-	 * Rewrite primary_index to OUR card minor and clear supports_sync_fd
+-	 * (SEMSURF_FENCE_CREATE returns its sync fd in an OUT field we forward
+-	 * verbatim, so the guest would receive the HOST's descriptor number;
+-	 * cross-boundary sync-fd passback is unimplemented -- see
+-	 * nvkvm_drm_fwd_semsurf_fence_create.  Claiming the capability anyway is
+-	 * what actually broke graphics: libnvidia-egl-wayland took the sync-fd
+-	 * presentation path, waited on a fence that could never signal, and
+-	 * every GL client hung on its first eglSwapBuffers -- glmark2 sat on
+-	 * scene 1 with 0 CPU time indefinitely, while the same weston+glmark2 on
+-	 * the host scored 21571).
+-	 *
+-	 * Both writes are version-keyed; nvkvm_drm_devinfo_fixup() is shared
+-	 * with tests/unit/test_drm_devinfo.c so the offsets it uses are pinned.
+-	 */
++	/* The shared, version-keyed fixup clears sync-file support by default.
++	 * Restore it only for negotiated, real host-to-guest fence transport.
++	 * The private capability bit covers import too: this experimental export
++	 * implementation is not yet qualified for general external-sync use. */
+ 	primary_index = *(__u32 *)(p + lay.primary_index_off);
+ 	if (dev && dev->primary)
+ 		primary_index = (unsigned)dev->primary->index;
+@@ -698,12 +687,8 @@
+ 	return 0;
+ }
+ 
+-/*
+- * SEMSURF_FENCE_CREATE takes fence_context_handle (a GEM handle from
+- * CTX_CREATE) — translate the guest proxy handle to the stub's before
+- * forwarding, restore after.  (fd@16 is an OUT sync fd; cross-boundary
+- * sync-fd passback is a separate milestone.)
+- */
++/* Translate the GEM context strictly and install a genuine guest sync_file.
++ * No host descriptor number is exposed to guest userspace. */
+ static int nvkvm_drm_fwd_semsurf_fence_create(struct drm_device *dev,
+     void *data, struct drm_file *file)
+ {

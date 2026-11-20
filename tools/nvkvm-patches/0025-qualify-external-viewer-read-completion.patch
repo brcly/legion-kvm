@@ -1,0 +1,93 @@
+--- a/src/qemu/virtio_nvgpu.h
++++ b/src/qemu/virtio_nvgpu.h
+@@ -299,6 +299,7 @@
+ 	bool                graphics;
+ 	bool                sync_file_bridge;
+ 	bool                strict_scanout_release;
++	bool                display_read_ack;
+ 	int64_t             halt_poll_ns;
+ 
+ 	/*
+--- a/src/qemu/virtio_nvgpu.c
++++ b/src/qemu/virtio_nvgpu.c
+@@ -1393,6 +1393,10 @@
+ 		error_setg(errp, "strict-scanout-release requires graphics and sync-file-bridge");
+ 		return;
+ 	}
++	if (nv->display_read_ack && !nv->strict_scanout_release) {
++		error_setg(errp, "display-read-ack requires strict-scanout-release");
++		return;
++	}
+ 	nvkvm_debug_enabled = (getenv("NVKVM_DEBUG") != NULL);
+ 
+ 	g_nvkvm_device = nv;
+@@ -1922,6 +1926,7 @@
+ 	DEFINE_PROP_BOOL("graphics", VirtIONvgpu, graphics, true),
+ 	DEFINE_PROP_BOOL("sync-file-bridge", VirtIONvgpu, sync_file_bridge, false),
+ 	DEFINE_PROP_BOOL("strict-scanout-release", VirtIONvgpu, strict_scanout_release, false),
++	DEFINE_PROP_BOOL("display-read-ack", VirtIONvgpu, display_read_ack, false),
+ 	DEFINE_PROP_INT64("halt-poll-ns", VirtIONvgpu, halt_poll_ns, -1),
+ };
+ 
+--- a/src/qemu/nvkvm_present_egl.c
++++ b/src/qemu/nvkvm_present_egl.c
+@@ -773,7 +773,7 @@
+          * leak of driver-side objects, and it is one call to stop it.
+          */
+         qemu_console_gl_release_dmabuf(p->con, p->cur_buf);
+-        if (p->nv->strict_scanout_release &&
++        if (p->nv->strict_scanout_release && !p->nv->display_read_ack &&
+             (p->cur_context != context || p->cur_key != key))
+             nvkvm_release_after_gpu(p, p->cur_context, p->cur_key);
+         qemu_dmabuf_close(p->cur_buf);
+@@ -1632,6 +1632,10 @@
+ {
+     NvkvmPresent *p = opaque;
+ 
++    /* One external update in flight; never replace its source before ACK. */
++    if (p->nv->display_read_ack && qemu_console_is_gl_blocked(p->con))
++        return true;
++
+     /* Readback path: the thread did the work; show the result. */
+     nvkvm_present_publish(p);
+ 
+@@ -1728,10 +1732,39 @@
+                               info->refresh_rate);
+ }
+ 
++/* Only a private, negotiated viewer contract calls this: its update reply
++ * means a real GPU read fence completed, not merely that a frame was queued. */
++static void nvkvm_present_read_complete(void *opaque, bool success)
++{
++    NvkvmPresent *p = opaque;
++    if (!p->nv->display_read_ack)
++        return;
++    if (!success) {
++        strict_releases.errors++;
++        error_report("nvkvm: external viewer read failed; source remains owned");
++        return;
++    }
++    unsigned before = p->release_count;
++    nvkvm_release_queue(p, p->cur_context, p->cur_key, -1, true);
++    if (p->release_count > before) {
++        strict_releases.dropped--;
++        strict_releases.gpu++;
++    }
++}
++
++static void nvkvm_present_gl_block(void *opaque, bool blocked)
++{
++    NvkvmPresent *p = opaque;
++    if (p->nv->display_read_ack && !blocked)
++        qemu_bh_schedule(p->bh);
++}
++
+ static const GraphicHwOps nvkvm_present_hwops = {
+     .invalidate  = nvkvm_present_invalidate,
+     .gfx_update  = nvkvm_present_gfx_update,
+     .ui_info     = nvkvm_present_ui_info,
++    .gl_block    = nvkvm_present_gl_block,
++    .gl_read_complete = nvkvm_present_read_complete,
+ };
+ 
+ /* Bottom half: runs on the main loop, pokes the display to drain the slot

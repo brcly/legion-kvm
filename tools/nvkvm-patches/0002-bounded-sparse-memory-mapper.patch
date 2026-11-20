@@ -1,0 +1,96 @@
+--- a/src/common/nvkvm_proto.h
++++ b/src/common/nvkvm_proto.h
+@@ -83,7 +83,7 @@
+ /* ── Shared memory layout ────────────────────────────────────────────────── */
+ 
+ #define NVKVM_SHM_SLOT_MIN_SIZE     (4096)
+-#define NVKVM_SHM_SLOT_DEFAULT_SIZE (64 * 1024)
++#define NVKVM_SHM_SLOT_DEFAULT_SIZE (256 * 1024)
+ #define NVKVM_SHM_NSLOTS            256
+ #define NVKVM_SHM_CTRL_SLOT         0
+ 
+--- a/src/qemu/nvkvm_ctrl_allowlist.h
++++ b/src/qemu/nvkvm_ctrl_allowlist.h
+@@ -133,6 +133,7 @@
+ 	0x00fd0102u,
+ 	0x00fd0104u,
+ 	0x00fd0105u,
++	0x00fe0101u, /* NV_MEMORY_MAPPER: inline operations; validated below. */
+ 	0x20800102u,
+ 	0x20800110u,
+ 	0x20800111u,
+@@ -396,6 +397,26 @@
+  * guess.  Verdicts are unchanged -- every caller tests `!allowed`, and all
+  * three non-zero returns are equally non-zero.
+  */
++/* OGKM 620.70.06: sizeof(params)=229392, operations[4096] @8,
++ * sizeof(operation)=56. No host pointers: only owned RM handles, GPU offsets
++ * and inline semaphore values. Refuse malformed counts/types before RM. */
++static inline int nvkvm_ctrl_params_valid(uint32_t cmd, const void *aux, uint32_t size)
++{
++    if (cmd != 0x00fe0101u) return 1;
++    if (!aux || size != 229392u) return 0;
++    const uint8_t *p = aux;
++    uint32_t count = (uint32_t)p[0] | (uint32_t)p[1] << 8 |
++                     (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
++    if (count > 4096u) return 0;
++    for (uint32_t i = 0; i < count; i++) {
++        const uint8_t *op = p + 8u + i * 56u;
++        uint32_t type = (uint32_t)op[0] | (uint32_t)op[1] << 8 |
++                        (uint32_t)op[2] << 16 | (uint32_t)op[3] << 24;
++        if (type > 4u) return 0;
++    }
++    return 1;
++}
++
+ #define NVKVM_CTRL_ALLOW_TABLE     1  /* an explicit, justified table row     */
+ #define NVKVM_CTRL_ALLOW_GSS       2  /* the cmd & 0x8000 wildcard            */
+ #define NVKVM_CTRL_ALLOW_BINAPI    3  /* the 0x2081-class wildcard            */
+--- a/src/qemu/nvkvm_isolate_handlers.c
++++ b/src/qemu/nvkvm_isolate_handlers.c
+@@ -3806,7 +3806,11 @@
+ 			return 0;
+ 		}
+ 		int cc_how = cc_readable ? nvkvm_ctrl_cmd_allowed(cc) : 0;
+-		if (!cc_readable || !cc_how || req->aux_size > (1u << 20)) {
++		if (!cc_readable || !cc_how || req->aux_size > (1u << 20) ||
++            !nvkvm_ctrl_params_valid(cc, aux_buf, req->aux_size) ||
++            (cc == 0x00fe0101u &&
++             (req->param_size != sizeof(struct nvos54_parameters) ||
++              ((struct nvos54_parameters *)param_buf)->params_size != req->aux_size))) {
+ 			nvkvm_ctrl_deny_log(cc);
+ 			/* As above: RM answers an unsupported control with a
+ 			 * successful ioctl carrying NV_ERR_NOT_SUPPORTED, not
+--- a/src/stub/nvkvm_stub.c
++++ b/src/stub/nvkvm_stub.c
+@@ -2925,7 +2925,7 @@
+ 	 * way RM reports it. */
+ 	uint32_t inner;
+ 	__builtin_memcpy(&inner, (const uint8_t *)param + 8, sizeof(inner));
+-	if (!nvkvm_ctrl_cmd_allowed(inner))
++	if (inner == 0x00fe0101u || !nvkvm_ctrl_cmd_allowed(inner))
+ 		return 1;
+ 
+ 	if (aux_size == 0)
+--- a/tests/unit/test_ctrl_gate.c
++++ b/tests/unit/test_ctrl_gate.c
+@@ -120,6 +120,19 @@
+ 	assert(NVKVM_CTRL_NOOP_N == 4);
+ 	printf("  ok   no-op set is exactly the 4 audited commands\n");
+ 
++    assert(nvkvm_ctrl_cmd_allowed(0x00fe0101u));
++    static uint8_t bulk[229392];
++    assert(nvkvm_ctrl_params_valid(0x00fe0101u, bulk, sizeof(bulk)));
++    assert(!nvkvm_ctrl_params_valid(0x00fe0101u, NULL, sizeof(bulk)));
++    assert(!nvkvm_ctrl_params_valid(0x00fe0101u, bulk, sizeof(bulk)-1));
++    bulk[1] = 0x10; /* max 4096 operations */
++    assert(nvkvm_ctrl_params_valid(0x00fe0101u, bulk, sizeof(bulk)));
++    bulk[0] = 1;
++    assert(!nvkvm_ctrl_params_valid(0x00fe0101u, bulk, sizeof(bulk)));
++    bulk[0] = 1; bulk[1] = 0; bulk[8] = 5;
++    assert(!nvkvm_ctrl_params_valid(0x00fe0101u, bulk, sizeof(bulk)));
++    bulk[8] = 4;
++    assert(nvkvm_ctrl_params_valid(0x00fe0101u, bulk, sizeof(bulk)));
+ 	printf("test_ctrl_gate: PASS\n");
+ 	return 0;
+ }

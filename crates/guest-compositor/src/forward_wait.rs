@@ -90,6 +90,28 @@ impl ForwardWait {
             "forwarding wait has no descriptors"
         );
         let mut fds = descriptors.map(|fd| PollFd::from_borrowed_fd(fd, PollFlags::IN));
+        self.poll_descriptors(&mut fds, gpu_pending)
+    }
+
+    pub fn wait_with_acquires<'fd, const N: usize>(
+        &mut self,
+        descriptors: [BorrowedFd<'fd>; N],
+        acquires: impl Iterator<Item = BorrowedFd<'fd>>,
+    ) -> Result<usize> {
+        let mut fds: Vec<_> = descriptors
+            .into_iter()
+            .chain(acquires)
+            .map(|fd| PollFd::from_borrowed_fd(fd, PollFlags::IN))
+            .collect();
+        self.poll_descriptors(&mut fds, false)?;
+        Ok(fds[N..]
+            .iter()
+            .filter(|fd| fd.revents().contains(PollFlags::IN))
+            .count())
+    }
+
+    fn poll_descriptors(&mut self, fds: &mut [PollFd<'_>], gpu_pending: bool) -> Result<()> {
+        ensure!(!fds.is_empty(), "forwarding wait has no descriptors");
         // GL acquisition fences have no pollable FD in the current path.
         let timeout = rustix::time::Timespec {
             tv_sec: 0,
@@ -100,7 +122,7 @@ impl ForwardWait {
             },
         };
         let started = Instant::now();
-        match poll(&mut fds, Some(&timeout)) {
+        match poll(fds, Some(&timeout)) {
             Ok(ready) => {
                 self.timeouts += u64::from(ready == 0);
                 ensure!(

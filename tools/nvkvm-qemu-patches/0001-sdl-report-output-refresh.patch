@@ -1,0 +1,29 @@
+--- a/ui/sdl2.c
++++ b/ui/sdl2.c
+@@ -892,11 +892,24 @@
+ 
+     switch (ev->window.event) {
+     case SDL_WINDOWEVENT_RESIZED:
++#if SDL_VERSION_ATLEAST(2, 0, 18)
++    case SDL_WINDOWEVENT_DISPLAY_CHANGED:
++#endif
+         {
++            int width, height;
++            SDL_DisplayMode mode;
++            int display = SDL_GetWindowDisplayIndex(scon->real_window);
++            SDL_GetWindowSize(scon->real_window, &width, &height);
+             QemuUIInfo info = {
+-                .width = ev->window.data1,
+-                .height = ev->window.data2,
++                .width = width,
++                .height = height,
+             };
++            if (display >= 0 && SDL_GetCurrentDisplayMode(display, &mode) == 0 &&
++                mode.refresh_rate >= 1 && mode.refresh_rate <= 1000) {
++                /* QemuUIInfo uses mHz, SDL uses whole Hz. The guest's
++                 * virtual vblank otherwise remains at its 60 Hz default. */
++                info.refresh_rate = mode.refresh_rate * 1000;
++            }
+             qemu_console_set_ui_info(scon->dcl.con, &info, true);
+         }
+         sdl2_redraw(scon);

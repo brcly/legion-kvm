@@ -1,0 +1,116 @@
+--- a/src/guest/nvkvm.h
++++ b/src/guest/nvkvm.h
+@@ -18,6 +18,7 @@
+ #include <linux/spinlock.h>
+ #include <linux/completion.h>
+ #include <linux/list.h>
++#include <linux/workqueue.h>
+ 
+ #include "../../src/common/nvkvm_proto.h"
+ #include "../../src/common/nvkvm_abi.h"
+@@ -317,6 +318,8 @@
+ 	refcount_t             refs;
+ 
+ 	/* poll support */
++	struct work_struct     poll_work;
++	struct file           *poll_file; /* borrowed; each queued work holds a file ref */
+ 	wait_queue_head_t      poll_wq;
+ 	atomic_t               poll_events; /* cached POLL* bits from host         */
+ 	atomic_t               poll_armed;  /* #127: 1 while the host is asked to
+--- a/src/guest/nvkvm_main.c
++++ b/src/guest/nvkvm_main.c
+@@ -71,6 +71,10 @@
+  * it.  A positive value overrides the probe; exposing more nodes than the
+  * host has just means opens on the extra ones fail.
+  */
++static bool nvkvm_poll_async;
++module_param_named(poll_async, nvkvm_poll_async, bool, 0444);
++MODULE_PARM_DESC(poll_async, "arm host poll notifications off the caller thread (research, default off)");
++
+ static int num_gpus = -1;
+ module_param(num_gpus, int, 0444);
+ MODULE_PARM_DESC(num_gpus,
+@@ -83,6 +87,7 @@
+ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg);
+ static int  nvkvm_mmap(struct file *filp, struct vm_area_struct *vma);
+ static __poll_t nvkvm_poll(struct file *filp, poll_table *wait);
++static void nvkvm_poll_arm_work(struct work_struct *work);
+ 
+ const struct file_operations nvkvm_fops = {   /* F-4: non-static so embedded-fd translation can type-check against it */
+ 	.owner          = THIS_MODULE,
+@@ -744,6 +749,7 @@
+ 		kfree(ctx);
+ 		return ERR_PTR(ret);
+ 	}
++	INIT_WORK(&ctx->poll_work, nvkvm_poll_arm_work);
+ 	init_waitqueue_head(&ctx->poll_wq);
+ 	atomic_set(&ctx->poll_events, 0);
+ 	atomic_set(&ctx->poll_armed, 0);   /* #127 */
+@@ -774,6 +780,7 @@
+  * GEMs) drops.  See the refs comment in struct nvkvm_fd_ctx. */
+ static void nvkvm_fd_ctx_destroy(struct nvkvm_fd_ctx *ctx)
+ {
++	cancel_work_sync(&ctx->poll_work);
+ 	/* #101: leave the async-event registry first so no VQ_EVT deliver() can
+ 	 * touch this ctx after we start tearing it down (unregister blocks until
+ 	 * any in-flight deliver() under the shared lock completes). */
+@@ -895,6 +902,7 @@
+ 		INIT_LIST_HEAD(&ctx->uvm_state->realizations);
+ 	}
+ 
++	ctx->poll_file = filp;
+ 	filp->private_data = ctx;
+ 	pr_debug("nvkvm: opened dev_id=%d handle_id=%u isolate_id=%u tgid=%d\n",
+ 		 dev_id, ctx->handle_id,
+@@ -909,6 +917,10 @@
+ 	if (!ctx)
+ 		return 0;
+ 
++	/* Worker fput() is deferred from kernel-thread context. Join here
++	 * before the file releases its module-owner reference. */
++	if (ctx)
++		cancel_work_sync(&ctx->poll_work);
+ 	nvkvm_fd_ctx_close(ctx);
+ 	filp->private_data = NULL;
+ 	return 0;
+@@ -3338,6 +3350,19 @@
+ 
+ /* ── poll ─────────────────────────────────────────────────────────────────── */
+ 
++static void nvkvm_poll_arm_work(struct work_struct *work)
++{
++	struct nvkvm_fd_ctx *ctx = container_of(work, struct nvkvm_fd_ctx, poll_work);
++	struct file *file = ctx->poll_file;
++
++	if (nvkvm_virtio_poll_arm(ctx->session->isolate_id, ctx->handle_id, 1))
++		atomic_set(&ctx->poll_armed, 0);
++	/* Do not turn a failed arm into a busy wake/retry loop. The original
++	 * poll timeout remains the fallback. The retained file pins ctx/session
++	 * through this request; fput from a kworker defers the final release. */
++	fput(file);
++}
++
+ static __poll_t nvkvm_poll(struct file *filp, poll_table *wait)
+ {
+ 	struct nvkvm_fd_ctx *ctx = filp->private_data;
+@@ -3373,9 +3398,18 @@
+ 		 * nothing is reported -- the fast wakeup simply stops existing.
+ 		 * That one went unnoticed across three driver versions.
+ 		 */
+-		if (nvkvm_virtio_poll_arm(ctx->session->isolate_id,
+-					  ctx->handle_id, 1))
++		if (nvkvm_poll_async) {
++			/* poll_wait() has already registered the waiter and the arm
++			 * flag was claimed before queueing: completion can arrive at
++			 * any time without losing a wakeup. One file ref per queued
++			 * execution also covers a requeue while the worker runs. */
++			get_file(filp);
++			if (!schedule_work(&ctx->poll_work))
++				fput(filp);
++		} else if (nvkvm_virtio_poll_arm(ctx->session->isolate_id,
++					       ctx->handle_id, 1)) {
+ 			atomic_set(&ctx->poll_armed, 0);
++		}
+ 	}
+ 	return events;
+ }

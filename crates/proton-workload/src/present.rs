@@ -15,6 +15,9 @@ static CLOSING: AtomicBool = AtomicBool::new(false);
 static PALETTE: AtomicU64 = AtomicU64::new(0);
 static KEY_EVENTS: AtomicU64 = AtomicU64::new(0);
 static POINTER_EVENTS: AtomicU64 = AtomicU64::new(0);
+static INPUT_QPC: AtomicU64 = AtomicU64::new(0);
+static LATENCY_MODE: AtomicBool = AtomicBool::new(false);
+static LATENCY_DELAY_MS: AtomicU64 = AtomicU64::new(0);
 const STYLE: WINDOW_STYLE = WS_POPUP;
 
 /// # Safety Called by Win32 with a live window and message arguments valid for DefWindowProcW.
@@ -25,7 +28,23 @@ unsafe extern "system" fn procedure(hwnd: HWND, message: u32, wp: WPARAM, lp: LP
             return LRESULT(0); // Defer destruction until all original GPU fences complete.
         }
         WM_KEYDOWN if wp.0 == 0x20 && lp.0 & (1 << 30) == 0 => {
-            PALETTE.fetch_xor(128, Ordering::Relaxed);
+            if LATENCY_MODE.load(Ordering::Relaxed) {
+                if let Ok(time) = counter() {
+                    INPUT_QPC.store(time, Ordering::Relaxed);
+                }
+                // Diagnostic-only positive control: a known source delay must
+                // appear in the independent host capture measurement.
+                let delay = LATENCY_DELAY_MS.load(Ordering::Relaxed) as u32;
+                if delay != 0 {
+                    // SAFETY: bounded delay on this owned diagnostic GUI thread.
+                    unsafe {
+                        Sleep(delay);
+                    }
+                }
+                PALETTE.fetch_add(1, Ordering::Relaxed);
+            } else {
+                PALETTE.fetch_xor(128, Ordering::Relaxed);
+            }
             KEY_EVENTS.fetch_add(1, Ordering::Relaxed);
         }
         WM_KEYDOWN if wp.0 == 0x1b => {
@@ -175,6 +194,8 @@ struct DrawObservation {
     image_hash: Option<u64>,
     clocks: [u64; 7],
     slot_blocked: bool,
+    present_count: u32,
+    fence: u64,
 }
 struct Readback {
     resource: ID3D12Resource,
@@ -414,7 +435,13 @@ impl<'a> Renderer<'a> {
         self.height = height;
         self.buffers()
     }
-    fn draw(&mut self, seed: u32, diagnostic: bool, probe: bool) -> Result<DrawObservation> {
+    fn draw(
+        &mut self,
+        seed: u32,
+        diagnostic: bool,
+        probe: bool,
+        feedback: bool,
+    ) -> Result<DrawObservation> {
         let stamp = || if probe { counter() } else { Ok(0) };
         let mut clocks = [0; 7];
         clocks[0] = stamp()?;
@@ -545,7 +572,15 @@ impl<'a> Renderer<'a> {
         clocks[4] = executed_at?;
         clocks[5] = presented_at?;
         clocks[6] = signalled_at?;
+        let present_count = if feedback {
+            // SAFETY: live owned swapchain; this call returns its submitted frame ID.
+            unsafe { self.chain.GetLastPresentCount() }.map_err(|e| e.to_string())?
+        } else {
+            0
+        };
         Ok(DrawObservation {
+            present_count,
+            fence: self.gpu.serial,
             image_hash,
             clocks,
             slot_blocked: waited[1] != 0 || waited[2] != 0,
@@ -564,27 +599,139 @@ impl Drop for Renderer<'_> {
     }
 }
 
+struct Feedback {
+    output: Handle,
+    frequency: u64,
+    ready: bool,
+    sequence: u32,
+    responses: u32,
+    pending: Option<(u32, u64, u64, u64)>, // first present ID, original fence, input QPC, submission QPC
+}
+impl Feedback {
+    fn new(frequency: u64) -> Result<Self> {
+        Ok(Self {
+            output: open("Z:\\frames\\runtime-feedback.log", true)?,
+            frequency,
+            ready: false,
+            sequence: 0,
+            responses: 0,
+            pending: None,
+        })
+    }
+    fn emit(&self, line: &str) -> Result<()> {
+        write_handle(self.output.0, line.as_bytes())?;
+        // SAFETY: this owner retains its valid writable file handle. Flush makes
+        // the small record visible through virtiofs; no GPU work/readback is added.
+        if unsafe { FlushFileBuffers(self.output.0) } == 0 {
+            return Err("flush runtime feedback".into());
+        }
+        Ok(())
+    }
+    fn observe(
+        &mut self,
+        renderer: &Renderer<'_>,
+        sequence: u32,
+        draw: &DrawObservation,
+    ) -> Result<()> {
+        if sequence != self.sequence {
+            if sequence != self.sequence + 1 || self.pending.is_some() {
+                return Err("runtime feedback input overtook pending frame".into());
+            }
+            self.sequence = sequence;
+            self.pending = Some((
+                draw.present_count,
+                draw.fence,
+                INPUT_QPC.load(Ordering::Relaxed),
+                counter()?,
+            ));
+        }
+        let mut stats = DXGI_FRAME_STATISTICS::default();
+        // SAFETY: initialized writable result and live owned swapchain.
+        let result = unsafe { renderer.chain.GetFrameStatistics(&mut stats) };
+        if let Err(error) = result {
+            if error.code() == DXGI_ERROR_FRAME_STATISTICS_DISJOINT {
+                return Ok(());
+            }
+            return Err(format!("runtime frame statistics unavailable: {error}"));
+        }
+        if stats.PresentCount == 0 {
+            return Ok(());
+        }
+        let time =
+            u64::try_from(stats.SyncQPCTime).map_err(|_| "negative runtime feedback clock")?;
+        let polled = counter()?;
+        if time == 0 || time > polled {
+            return Err("runtime feedback clock is invalid".into());
+        }
+        if !self.ready {
+            self.emit(&format!("LEGION_FEEDBACK_READY {}\n", self.frequency))?;
+            self.ready = true;
+        }
+        if let Some((target, fence, input, submitted)) = self.pending {
+            // SAFETY: this reads the original queue fence, never a replacement completion.
+            let completed = unsafe { renderer.gpu.fence.GetCompletedValue() };
+            let polled = counter()?;
+            if completed == u64::MAX {
+                return Err("original GPU fence reported device removal".into());
+            }
+            if stats.PresentCount >= target && completed >= fence {
+                if time < input || submitted < input || polled < submitted {
+                    return Err("runtime frame feedback predates its input".into());
+                }
+                self.emit(&format!(
+                    "LEGION_FEEDBACK {} {} {} {} {} {} {} {} {}\n",
+                    self.sequence,
+                    target,
+                    stats.PresentCount,
+                    input,
+                    submitted,
+                    time,
+                    polled,
+                    fence,
+                    completed
+                ))?;
+                self.responses += 1;
+                self.pending = None;
+            }
+        }
+        Ok(())
+    }
+}
+
 pub(super) fn run(config: &Config, frequency: u64) -> Result<()> {
     let settings = config
         .presentation
         .as_ref()
         .ok_or("missing presentation configuration")?;
+    LATENCY_MODE.store(settings.latency_probe, Ordering::Relaxed);
+    LATENCY_DELAY_MS.store(u64::from(settings.latency_delay_ms), Ordering::Relaxed);
     let window = Window::new(config.width, config.height)?;
     window.settle(config.width, config.height)?;
     let mut gpu = Gpu::new(config, frequency)?;
     let original_hash = gpu.verify()?;
     let mut renderer = Renderer::new(&mut gpu, &window, settings.fragment_iterations)?;
+    if settings.latency_probe {
+        renderer.fragment_iterations |= 1 << 31;
+    }
+    if settings.frame_tags {
+        renderer.fragment_iterations |= 1 << 30;
+    }
     let cpu_expected = (settings.cpu_rounds != 0).then(|| cpu_work(settings.cpu_rounds));
     let mut cpu_frames_verified = 0_u64;
     let mut checks = Vec::new();
     let mut samples = Vec::with_capacity(1_000_000);
     let mut diagnostic_frames = Vec::new();
+    let mut tagged_frames = Vec::new();
     let mut stage_samples =
         Vec::<[u64; 8]>::with_capacity(if settings.stage_probe { 1_000_000 } else { 0 });
     let mut blocked_slots = 0_u64;
     let mut resizes = 0;
     let mut resize_stage = 0;
     let mut final_check = false;
+    let mut feedback = settings
+        .runtime_feedback
+        .then(|| Feedback::new(frequency))
+        .transpose()?;
     let start = counter()?;
     let mut before = start;
     loop {
@@ -596,15 +743,17 @@ pub(super) fn run(config: &Config, frequency: u64) -> Result<()> {
             break;
         }
         if settings.resize {
-            let phase = (elapsed * 3 / (frequency * u64::from(settings.seconds))).min(2);
+            let phases = u64::from(settings.resize_cycles) * 2;
+            let phase =
+                (elapsed * (phases + 1) / (frequency * u64::from(settings.seconds))).min(phases);
             if phase > resize_stage {
                 window.resize(
-                    if phase == 1 {
+                    if phase % 2 == 1 {
                         config.width * 3 / 4
                     } else {
                         config.width
                     },
-                    if phase == 1 {
+                    if phase % 2 == 1 {
                         config.height * 3 / 4
                     } else {
                         config.height
@@ -637,16 +786,53 @@ pub(super) fn run(config: &Config, frequency: u64) -> Result<()> {
             diagnostic = true;
             final_check = true;
         }
-        let seed = (elapsed * 60 / frequency) as u32 ^ PALETTE.load(Ordering::Relaxed) as u32;
+        let sequence = if settings.latency_probe {
+            PALETTE.load(Ordering::Relaxed) as u32
+        } else {
+            (elapsed * 60 / frequency) as u32 ^ PALETTE.load(Ordering::Relaxed) as u32
+        };
+        let source_frame = if settings.frame_tags {
+            let id = u16::try_from(samples.len() + 1).map_err(|_| "source frame tag exhausted")?;
+            if sequence > u32::from(u16::MAX) {
+                return Err("input generation tag exhausted".into());
+            }
+            u32::from(id)
+        } else {
+            0
+        };
+        let seed = sequence | (source_frame << 16);
         if let Some(expected) = cpu_expected {
             if cpu_work(settings.cpu_rounds) != expected {
                 return Err("presentation CPU checksum mismatch".into());
             }
             cpu_frames_verified += 1;
         }
-        let observed = renderer.draw(seed, diagnostic, settings.stage_probe)?;
+        if diagnostic && let Some(feedback) = &feedback {
+            feedback.emit(&format!(
+                "LEGION_FEEDBACK_READBACK {} {}\n",
+                sequence,
+                counter()?
+            ))?;
+        }
+        let observed = renderer.draw(
+            seed,
+            diagnostic,
+            settings.stage_probe,
+            settings.runtime_feedback,
+        )?;
         if diagnostic {
             diagnostic_frames.push(samples.len());
+        }
+        if let Some(feedback) = &mut feedback {
+            feedback.observe(&renderer, sequence, &observed)?;
+        }
+        if settings.frame_tags {
+            tagged_frames.push([
+                source_frame as u64,
+                u64::from(sequence),
+                u64::from(observed.present_count),
+                observed.fence,
+            ]);
         }
         if let Some(hash) = observed.image_hash {
             checks.push(serde_json::json!({"width":width,"height":height,"seed":seed,"hash":hash,"pixels":u64::from(width)*u64::from(height)}));
@@ -733,6 +919,9 @@ pub(super) fn run(config: &Config, frequency: u64) -> Result<()> {
         "source_frame_stages":stage_report,"profiled_frames":stage_samples.len(),"profiled_slot_waits":blocked_slots,"diagnostic_frames_excluded_from_stage_profile":checks.len(),
         "image_checks":checks,"pipeline_changes_per_frame":2,"draws_per_frame":2,"swapchain_buffers":3,
         "fragment_iterations":settings.fragment_iterations,"frame_cpu_rounds":settings.cpu_rounds,
+        "latency_probe":settings.latency_probe,"runtime_feedback":settings.runtime_feedback,"frame_tags":settings.frame_tags,
+        "tagged_frames":tagged_frames,
+        "runtime_feedback_samples":feedback.as_ref().map_or(0, |feedback|feedback.responses),"latency_delay_ms":settings.latency_delay_ms,
         "cpu_frames_verified":cpu_frames_verified,"expected_cpu_checksum":cpu_expected,
         "resize_count":resizes,"space_events":KEY_EVENTS.load(Ordering::Relaxed),"pointer_events":POINTER_EVENTS.load(Ordering::Relaxed),
         "close_requested":CLOSING.load(Ordering::Relaxed),"original_queue_drained":true});

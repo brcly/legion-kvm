@@ -1,0 +1,190 @@
+--- a/src/qemu/nvkvm_present_egl.c
++++ b/src/qemu/nvkvm_present_egl.c
+@@ -643,12 +643,15 @@
+             strict_releases.gpu, strict_releases.dropped, strict_releases.errors);
+ }
+ 
++/* NVKVM_GPU_RELEASE_TYPES_BEGIN */
+ typedef struct NvkvmGpuRelease {
+     uint32_t context, key;
+     int fd;
+     bool ready, failed;
+ } NvkvmGpuRelease;
+-
++/* NVKVM_GPU_RELEASE_TYPES_END */
++
++/* NVKVM_GPU_RELEASE_POLL_BEGIN */
+ static void nvkvm_release_poll(void *opaque)
+ {
+     NvkvmPresent *p = opaque;
+@@ -678,6 +681,8 @@
+     if (p->releases)
+         timer_mod(p->release_timer, qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 1);
+ }
++
++/* NVKVM_GPU_RELEASE_POLL_END */
+ 
+ static void nvkvm_release_queue(NvkvmPresent *p, uint32_t context, uint32_t key, int fd, bool ready)
+ {
+--- a/tests/unit/Makefile
++++ b/tests/unit/Makefile
+@@ -44,7 +44,7 @@
+ 
+ .PHONY: all clean run check
+ 
+-all: test_scanout_ownership test_objects test_handle mock_stub test_isolate test_tables test_open_scm test_ctrl_gate test_nvkms_allowlist test_stub_ptr_sanitize test_kvm_slot test_stub_window test_drm_devinfo test_r1_type_dev test_transport_ready test_relay_state test_relay_clip test_relay_wiring test_relay_bufmap test_uidmap
++all: test_host_release test_scanout_ownership test_objects test_handle mock_stub test_isolate test_tables test_open_scm test_ctrl_gate test_nvkms_allowlist test_stub_ptr_sanitize test_kvm_slot test_stub_window test_drm_devinfo test_r1_type_dev test_transport_ready test_relay_state test_relay_clip test_relay_wiring test_relay_bufmap test_uidmap
+ 
+ test_objects: $(OBJECTS_SRCS)
+ 	$(CC) $(CFLAGS) -o $@ $(OBJECTS_SRCS) $(LDFLAGS)
+@@ -267,3 +267,13 @@
+ 
+ test_scanout_ownership: test_scanout_ownership.c kms_ownership_types.inc kms_ownership.inc
+ 	$(CC) $(CFLAGS) -I. -o $@ $<
++
++# Extract the real poll/retry logic; mock only kernel status and VQ capacity.
++host_release_types.inc: ../../src/qemu/nvkvm_present_egl.c
++	awk '/NVKVM_GPU_RELEASE_TYPES_BEGIN/,/NVKVM_GPU_RELEASE_TYPES_END/' $< > $@
++
++host_release_poll.inc: ../../src/qemu/nvkvm_present_egl.c
++	awk '/NVKVM_GPU_RELEASE_POLL_BEGIN/,/NVKVM_GPU_RELEASE_POLL_END/' $< > $@
++
++test_host_release: test_host_release.c host_release_types.inc host_release_poll.inc
++	$(CC) $(CFLAGS) -I. -o $@ $< $(shell pkg-config --cflags --libs glib-2.0)
+--- a/tests/unit/run_tests.sh
++++ b/tests/unit/run_tests.sh
+@@ -69,6 +69,7 @@
+ declare -A MARKER_SUITES=(
+     [test_uidmap]="test_uidmap passed"
+     [test_scanout_ownership]="scanout ownership passed"
++    [test_host_release]="host release retry passed"
+     [test_open_scm]="ALL OPEN_SCM TESTS PASSED"
+     [test_ctrl_gate]="test_ctrl_gate: PASS"
+ )
+--- /dev/null
++++ b/tests/unit/test_host_release.c
+@@ -0,0 +1,124 @@
++/* Production GPU-completion/retry loop, with kernel/VQ boundaries mocked. */
++#include <assert.h>
++#include <errno.h>
++#include <glib.h>
++#include <linux/sync_file.h>
++#include <stdbool.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <unistd.h>
++
++#include "host_release_types.inc"
++typedef struct NvkvmPresent {
++    GList *releases;
++    void *release_timer, *nv;
++    unsigned release_count;
++} NvkvmPresent;
++static struct { uint64_t gpu, dropped, errors; } strict_releases;
++static int kernel_status, kernel_error, capacity;
++static unsigned delivered, closed, timers, errors;
++static uint32_t last_context, last_key;
++
++static int mock_ioctl(int fd, unsigned long request, void *data)
++{
++    assert(fd == 42 && request == SYNC_IOC_FILE_INFO);
++    if (kernel_error) { errno = EIO; return -1; }
++    ((struct sync_file_info *)data)->status = kernel_status;
++    return 0;
++}
++static int mock_close(int fd) { assert(fd == 42); closed++; return 0; }
++static bool nvkvm_virtio_try_scanout_release(void *nv, uint32_t context, uint32_t key)
++{
++    assert(nv);
++    if (!capacity) return false;
++    capacity--;
++    delivered++;
++    last_context = context;
++    last_key = key;
++    return true;
++}
++static int64_t qemu_clock_get_ms(int clock) { assert(clock == 0); return 1000; }
++static void timer_mod(void *timer, int64_t deadline)
++{
++    assert(timer && deadline == 1001);
++    timers++;
++}
++static void mock_error(const char *text) { assert(text); errors++; }
++#define QEMU_CLOCK_REALTIME 0
++#define ioctl mock_ioctl
++#define close mock_close
++#define error_report mock_error
++#include "host_release_poll.inc"
++#undef ioctl
++#undef close
++
++static NvkvmGpuRelease *add(NvkvmPresent *p, uint32_t context, uint32_t key, bool ready)
++{
++    NvkvmGpuRelease *r = g_new0(NvkvmGpuRelease, 1);
++    r->context = context;
++    r->key = key;
++    r->ready = ready;
++    r->fd = ready ? -1 : 42;
++    p->releases = g_list_prepend(p->releases, r);
++    p->release_count++;
++    return r;
++}
++static void clear_failed(NvkvmPresent *p)
++{
++    for (GList *n = p->releases; n; n = n->next) g_free(n->data);
++    g_list_free(p->releases);
++    p->releases = NULL;
++    p->release_count = 0;
++}
++
++int main(void)
++{
++    NvkvmPresent p = { .nv = &p, .release_timer = &p };
++    NvkvmGpuRelease *r = add(&p, 11, 7, false);
++    capacity = 1;
++    nvkvm_release_poll(&p);
++    assert(!r->ready && !delivered && !closed && p.release_count == 1);
++    /* GPU completed, but the event queue has no receive buffers. */
++    kernel_status = 1;
++    capacity = 0;
++    nvkvm_release_poll(&p);
++    assert(r->ready && r->fd == -1 && closed == 1 && !delivered);
++    assert(p.release_count == 1 && strict_releases.gpu == 1);
++    for (unsigned i = 0; i < 3; i++) nvkvm_release_poll(&p);
++    assert(!delivered && closed == 1 && p.release_count == 1);
++    capacity = 1;
++    nvkvm_release_poll(&p);
++    assert(delivered == 1 && !p.releases && !p.release_count);
++    assert(last_context == 11 && last_key == 7);
++
++    /* A failed read fence is never reported as safe source reuse. */
++    r = add(&p, 12, 8, false);
++    kernel_status = -ETIMEDOUT;
++    capacity = 1;
++    nvkvm_release_poll(&p);
++    assert(r->failed && !r->ready && delivered == 1 && errors == 1);
++    kernel_status = 1;
++    nvkvm_release_poll(&p);
++    assert(delivered == 1 && errors == 1);
++    clear_failed(&p);
++    r = add(&p, 12, 9, false);
++    kernel_error = 1;
++    nvkvm_release_poll(&p);
++    assert(r->failed && !r->ready && delivered == 1 && errors == 2);
++    clear_failed(&p);
++    kernel_error = 0;
++
++    /* Dropped-before-consumption notifications obey the same retry rule,
++     * and exhausting the queue midway cannot discard another buffer's ack. */
++    add(&p, 13, 10, true);
++    add(&p, 14, 11, true);
++    capacity = 1;
++    nvkvm_release_poll(&p);
++    assert(delivered == 2 && p.release_count == 1);
++    capacity = 1;
++    nvkvm_release_poll(&p);
++    assert(delivered == 3 && !p.release_count && !p.releases);
++    assert(strict_releases.errors == 2 && timers >= 7);
++    puts("host release retry passed");
++    return 0;
++}

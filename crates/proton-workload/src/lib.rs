@@ -57,8 +57,15 @@ impl Config {
             && (!self.diagnostic_cpu_profile || self.pipeline.is_some())
             && self.presentation.as_ref().is_none_or(|p| {
                 (15..=30).contains(&p.seconds)
-                    && p.fragment_iterations <= 8192
+                    && p.fragment_iterations <= if p.latency_probe { 65536 } else { 8192 }
+                    && (1..=48).contains(&p.resize_cycles)
+                    && (p.resize || p.resize_cycles == 1)
                     && p.cpu_rounds <= 1_000_000
+                    && (!p.runtime_feedback || p.latency_probe)
+                    && (!p.frame_tags || p.runtime_feedback)
+                    && p.latency_delay_ms <= 100
+                    && (p.latency_probe || p.latency_delay_ms == 0)
+                    && (!p.latency_probe || (!p.resize && !p.stage_probe))
                     && self.pipeline.is_none()
                     && !self.diagnostic_cpu_profile
                     && !self.diagnostic_event_trace

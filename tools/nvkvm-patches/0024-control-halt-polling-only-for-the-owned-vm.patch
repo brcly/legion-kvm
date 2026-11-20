@@ -1,0 +1,71 @@
+--- a/src/qemu/virtio_nvgpu.c
++++ b/src/qemu/virtio_nvgpu.c
+@@ -31,6 +31,7 @@
+  */
+ 
+ #include "qemu/osdep.h"
++#include <linux/kvm.h>
+ #include "hw/virtio/virtio.h"
+ #include "hw/core/qdev-properties.h"
+ #include "hw/pci/pci.h"          /* nvkvm-gpu PCI identity device */
+@@ -1411,6 +1412,7 @@
+ 	 * on it.  (We can't include sysemu/kvm_int.h here — kvm_int.h is
+ 	 * target-only.)
+ 	 */
++	int owned_vm_fd = -1;
+ 	{
+ 		DIR *d = opendir("/proc/self/fd");
+ 		if (d) {
+@@ -1424,6 +1426,7 @@
+ 				link[n] = 0;
+ 				if (strcmp(link, "anon_inode:kvm-vm") == 0) {
+ 					int fd = atoi(de->d_name);
++					owned_vm_fd = fd;
+ 					nvkvm_set_kvm_vm_fd(fd);
+ 					NVKVM_DBG(
+ 						"nvkvm: registered KVM vm fd %d\n", fd);
+@@ -1432,6 +1435,26 @@
+ 			}
+ 			closedir(d);
+ 		}
++	}
++	if (nv->halt_poll_ns < -1 || nv->halt_poll_ns > 2000000) {
++		error_setg(errp, "halt-poll-ns must be -1 (system policy) or 0..2000000");
++		return;
++	}
++	if (nv->halt_poll_ns >= 0) {
++		if (owned_vm_fd < 0 || ioctl(owned_vm_fd, KVM_CHECK_EXTENSION,
++			(unsigned long)KVM_CAP_HALT_POLL) <= 0) {
++			error_setg(errp, "owned VM does not support KVM_CAP_HALT_POLL");
++			return;
++		}
++		struct kvm_enable_cap cap = {
++			.cap = KVM_CAP_HALT_POLL,
++			.args[0] = (uint64_t)nv->halt_poll_ns,
++		};
++		if (ioctl(owned_vm_fd, KVM_ENABLE_CAP, &cap) < 0) {
++			error_setg_errno(errp, errno, "set owned VM halt polling");
++			return;
++		}
++		info_report("LEGION_KVM_HALT_POLL max_ns=%" PRIi64 " scope=owned-vm", nv->halt_poll_ns);
+ 	}
+ 	int fd;
+ 
+@@ -1899,6 +1922,7 @@
+ 	DEFINE_PROP_BOOL("graphics", VirtIONvgpu, graphics, true),
+ 	DEFINE_PROP_BOOL("sync-file-bridge", VirtIONvgpu, sync_file_bridge, false),
+ 	DEFINE_PROP_BOOL("strict-scanout-release", VirtIONvgpu, strict_scanout_release, false),
++	DEFINE_PROP_INT64("halt-poll-ns", VirtIONvgpu, halt_poll_ns, -1),
+ };
+ 
+ static void virtio_nvgpu_class_init(ObjectClass *klass, const void *data)
+--- a/src/qemu/virtio_nvgpu.h
++++ b/src/qemu/virtio_nvgpu.h
+@@ -299,6 +299,7 @@
+ 	bool                graphics;
+ 	bool                sync_file_bridge;
+ 	bool                strict_scanout_release;
++	int64_t             halt_poll_ns;
+ 
+ 	/*
+ 	 * The isolation mode actually in force, resolved at realize (mode `auto`

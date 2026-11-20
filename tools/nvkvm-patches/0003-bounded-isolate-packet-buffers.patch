@@ -1,0 +1,29 @@
+--- a/src/qemu/nvkvm_isolate.c
++++ b/src/qemu/nvkvm_isolate.c
+@@ -1663,6 +1663,26 @@
+ 	int sv[2];
+ 	if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, sv) < 0)
+ 		return -errno;
++
++	/* The largest accepted inline RM control is 229392 bytes. SEQPACKET
++	 * sends must fit in one message (default SO_SNDBUF is only 212992).
++	 * Reserve a bounded 256 KiB on each endpoint before spawning the stub;
++	 * Linux doubles this accounting limit. Fail before sending any header
++	 * if the kernel cannot support the maximum 256 KiB payload. */
++	for (int i = 0; i < 2; i++) {
++		int size = 256 * 1024;
++		if (setsockopt(sv[i], SOL_SOCKET, SO_SNDBUF, &size, sizeof(size)) < 0) {
++			int err = errno;
++			close(sv[0]); close(sv[1]);
++			return -err;
++		}
++		socklen_t len = sizeof(size);
++		if (getsockopt(sv[i], SOL_SOCKET, SO_SNDBUF, &size, &len) < 0 ||
++		    size < 256 * 1024 + 32) {
++			close(sv[0]); close(sv[1]);
++			return -EMSGSIZE;
++		}
++	}
+ 
+ 	/*
+ 	 * F2-1: bound every recv on QEMU's end.  Only sv[0] (ours) gets it —

@@ -1,0 +1,47 @@
+--- a/src/qemu/virtio_nvgpu.c
++++ b/src/qemu/virtio_nvgpu.c
+@@ -952,6 +952,36 @@
+ 	aio_bh_schedule_oneshot(qemu_get_aio_context(), nvkvm_release_push_bh, p);
+ }
+ 
++/* Opt-in diagnostic counters. VQ dispatch is serialized by the BQL. */
++static uint64_t nvkvm_request_counts[64];
++static bool nvkvm_request_stats_enabled;
++static bool nvkvm_request_stats_initialized;
++
++static void nvkvm_request_stats_dump(void)
++{
++    for (unsigned i = 0; i < ARRAY_SIZE(nvkvm_request_counts); i++) {
++        if (nvkvm_request_counts[i]) {
++            fprintf(stderr, "nvkvm request total: type=%u count=%" PRIu64 "\n",
++                    i, nvkvm_request_counts[i]);
++        }
++    }
++}
++
++static void nvkvm_request_stats_record(uint32_t type)
++{
++    if (!nvkvm_request_stats_initialized) {
++        const char *value = getenv("NVKVM_REQUEST_STATS");
++        nvkvm_request_stats_enabled = value && !strcmp(value, "1");
++        if (nvkvm_request_stats_enabled) {
++            atexit(nvkvm_request_stats_dump);
++        }
++        nvkvm_request_stats_initialized = true;
++    }
++    if (nvkvm_request_stats_enabled && type < ARRAY_SIZE(nvkvm_request_counts)) {
++        nvkvm_request_counts[type]++;
++    }
++}
++
+ static void nvkvm_tx_handler(VirtIODevice *vdev, VirtQueue *vq)
+ {
+ 	VirtIONvgpu *nv = VIRTIO_NVGPU(vdev);
+@@ -974,6 +1004,7 @@
+ 			g_free(elem);
+ 			continue;
+ 		}
++		nvkvm_request_stats_record(le32_to_cpu(hdr.type));
+ 		switch (le32_to_cpu(hdr.type)) {
+ 
+ 		/* ── Isolate/handle request types ────────────────────────────────── */

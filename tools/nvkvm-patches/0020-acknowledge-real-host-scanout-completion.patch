@@ -1,0 +1,738 @@
+--- a/src/common/nvkvm_proto.h
++++ b/src/common/nvkvm_proto.h
+@@ -67,6 +67,8 @@
+ /* Real host sync_file export/status transport; graphics-gated, opt-in. */
+ #define NVKVM_CONFIG_F_SYNC_FILE (1ULL << 1)
+ #define NVKVM_CONFIG_F_SYNC_FILE_IMPORT (1ULL << 2)
++/* Host GPU read-completion acknowledgements; never timeout into reuse. */
++#define NVKVM_CONFIG_F_SCANOUT_RELEASE (1ULL << 3)
+ 
+ /* ── Protocol version ────────────────────────────────────────────────────── */
+ 
+@@ -589,6 +591,8 @@
+ #define NVKVM_EVT_TYPE_POLL     0u
+ #define NVKVM_EVT_TYPE_UI_INFO  1u
+ #define NVKVM_EVT_TYPE_RELEASE  2u
++/* Same layout, first word is a render-handle ID (not an isolate ID). */
++#define NVKVM_EVT_TYPE_SCANOUT_RELEASE 3u
+ 
+ struct nvkvm_evt_poll {
+ 	__le32 isolate_id;
+--- a/src/guest/nvkvm.h
++++ b/src/guest/nvkvm.h
+@@ -405,6 +405,7 @@
+ 	 * When false the guest tears down modeset + skips the DRM render node. */
+ 	bool           graphics_enabled;
+ 	bool sync_file_bridge;
++	bool strict_scanout_release;
+ 
+ 	/* Session management */
+ 	struct mutex   sessions_lock;
+@@ -551,6 +552,7 @@
+  * them costs nothing.  See NVKVM_KMS_PRESENT_WAIT_DEFAULT in nvkvm_kms.c.
+  */
+ void nvkvm_kms_buffer_released(__u32 isolate_id, __u32 stub_handle);
++void nvkvm_kms_scanout_released(__u32 render_handle, __u32 stub_handle);
+ 
+ /* nvkvm_virtio.c — transport layer */
+ int  nvkvm_virtio_init(struct virtio_device *vdev, struct nvkvm_state *state);
+--- a/src/guest/nvkvm_kms.c
++++ b/src/guest/nvkvm_kms.c
+@@ -250,6 +250,11 @@
+ 		nvkvm_kms_max_h = nvkvm_kms_h;
+ 
+ }
++
++struct nvkvm_bp_buffer {
++	u32 iso, gem; /* strict mode uses the globally unique render handle as actor */
++	bool queued, held;
++};
+ 
+ struct nvkvm_kms {
+ 	struct drm_connector            conn;
+@@ -313,10 +318,7 @@
+ 	 * is therefore always done after dropping pending_lock -- see
+ 	 * nvkvm_bp_take_event()/nvkvm_bp_send().
+ 	 */
+-	struct {
+-		u32                     iso;   /* 0 means the slot is free */
+-		u32                     gem;
+-	}                               bp_inflight[NVKVM_KMS_BP_SLOTS];
++	struct nvkvm_bp_buffer bp_inflight[NVKVM_KMS_BP_SLOTS];
+ 	unsigned int                    bp_next; /* round-robin overwrite cursor */
+ 	/*
+ 	 * ARMED ONLY BY EVIDENCE.  False until a release for one of our own bos
+@@ -372,38 +374,45 @@
+ }
+ 
+ /* Remember that the host has been handed this bo.  pending_lock held. */
+-static void nvkvm_bp_track(struct nvkvm_kms *kms, u32 iso, u32 gem)
+-{
+-	unsigned int i;
+-
+-	if (!gem || nvkvm_bp_inflight(kms, iso, gem))
++static struct nvkvm_bp_buffer *nvkvm_bp_find(struct nvkvm_kms *kms, u32 actor, u32 gem)
++{
++	for (unsigned int i = 0; i < NVKVM_KMS_BP_SLOTS; i++)
++		if (kms->bp_inflight[i].iso == actor && kms->bp_inflight[i].gem == gem)
++			return &kms->bp_inflight[i];
++	return NULL;
++}
++
++static struct nvkvm_bp_buffer *nvkvm_bp_track(struct nvkvm_kms *kms, u32 actor, u32 gem)
++{
++	if (!gem)
++		return NULL;
++	struct nvkvm_bp_buffer *slot = nvkvm_bp_find(kms, actor, gem);
++	if (slot)
++		return slot;
++	for (unsigned int i = 0; i < NVKVM_KMS_BP_SLOTS; i++) {
++		if (!kms->bp_inflight[i].gem) {
++			slot = &kms->bp_inflight[i];
++			goto found;
++		}
++	}
++	if (nvkvm.strict_scanout_release)
++		return NULL; /* Never evict a source whose host reader is still live. */
++	slot = &kms->bp_inflight[kms->bp_next++ % NVKVM_KMS_BP_SLOTS];
++found:
++	*slot = (struct nvkvm_bp_buffer){ .iso = actor, .gem = gem };
++	return slot;
++}
++
++/* pending_lock held. */
++static void nvkvm_bp_untrack(struct nvkvm_kms *kms, u32 actor, u32 gem)
++{
++	struct nvkvm_bp_buffer *slot = nvkvm_bp_find(kms, actor, gem);
++	if (!slot)
+ 		return;
+-	for (i = 0; i < NVKVM_KMS_BP_SLOTS; i++) {
+-		if (!kms->bp_inflight[i].gem) {
+-			kms->bp_inflight[i].iso = iso;
+-			kms->bp_inflight[i].gem = gem;
+-			return;
+-		}
+-	}
+-	/* Full.  Overwriting the oldest recorded entry is the right failure:
+-	 * a ring deeper than the table means the entries we are dropping are
+-	 * the ones least likely to still be held. */
+-	i = kms->bp_next++ % NVKVM_KMS_BP_SLOTS;
+-	kms->bp_inflight[i].iso = iso;
+-	kms->bp_inflight[i].gem = gem;
+-}
+-
+-/* pending_lock held. */
+-static void nvkvm_bp_untrack(struct nvkvm_kms *kms, u32 iso, u32 gem)
+-{
+-	unsigned int i;
+-
+-	for (i = 0; i < NVKVM_KMS_BP_SLOTS; i++)
+-		if (kms->bp_inflight[i].gem == gem &&
+-		    kms->bp_inflight[i].iso == iso) {
+-			kms->bp_inflight[i].iso = 0;
+-			kms->bp_inflight[i].gem = 0;
+-		}
++	slot->held = false;
++	if (nvkvm.strict_scanout_release && slot->queued)
++		return;
++	*slot = (struct nvkvm_bp_buffer){0};
+ }
+ 
+ /*
+@@ -502,7 +511,7 @@
+ 	u32 gem = 0, iso;
+ 	bool held = false;
+ 
+-	if (!periods || !old_fb)
++	if ((!periods && !nvkvm.strict_scanout_release) || !old_fb)
+ 		return false;
+ 	/*
+ 	 * Same buffer in and out (a damage-only commit).  Gating on it would be
+@@ -519,7 +528,7 @@
+ 		return false;
+ 	/* A zero handle would match the zeroed free slots in bp_inflight[] and
+ 	 * gate on a buffer that does not exist -- hence the !gem above. */
+-	iso = fctx->session->isolate_id;
++	iso = nvkvm.strict_scanout_release ? fctx->handle_id : fctx->session->isolate_id;
+ 
+ 	spin_lock_irqsave(&kms->pending_lock, flags);
+ 	if (kms->bp_armed && !kms->stopping && !kms->bp_event &&
+@@ -543,8 +552,9 @@
+ 		 * the vblank timer inside this same lock for the same reason.
+ 		 * hrtimer_start() is safe here: it takes no sleeping lock.
+ 		 */
+-		hrtimer_start(&kms->bp_timer, kms->bp_deadline,
+-			      HRTIMER_MODE_ABS);
++		if (!nvkvm.strict_scanout_release)
++			hrtimer_start(&kms->bp_timer, kms->bp_deadline,
++				      HRTIMER_MODE_ABS);
+ 		held = true;
+ 	}
+ 	spin_unlock_irqrestore(&kms->pending_lock, flags);
+@@ -560,7 +570,7 @@
+  * whichever of this function and nvkvm_bp_timer_fn takes the event under
+  * pending_lock first wins, and the loser finds NULL and does nothing.
+  */
+-void nvkvm_kms_buffer_released(u32 isolate_id, u32 stub_handle)
++static void nvkvm_kms_release_common(u32 isolate_id, u32 stub_handle)
+ {
+ 	struct drm_pending_vblank_event *e = NULL;
+ 	struct nvkvm_kms *kms;
+@@ -595,11 +605,24 @@
+ 	kms->n_bp_freed++;
+ 	nvkvm_bp_untrack(kms, isolate_id, stub_handle);
+ 	if (kms->bp_event && kms->bp_wait_gem == stub_handle &&
+-	    kms->bp_wait_iso == isolate_id)
++	    kms->bp_wait_iso == isolate_id &&
++	    (!nvkvm.strict_scanout_release || !nvkvm_bp_inflight(kms, isolate_id, stub_handle)))
+ 		e = nvkvm_bp_take_event(kms);
+ 	spin_unlock_irqrestore(&kms->pending_lock, flags);
+ 	nvkvm_bp_send(kms, e);
+ 	spin_unlock_irqrestore(&nvkvm_kms_head_lock, head_flags);
++}
++
++void nvkvm_kms_buffer_released(u32 isolate_id, u32 stub_handle)
++{
++	if (!nvkvm.strict_scanout_release)
++		nvkvm_kms_release_common(isolate_id, stub_handle);
++}
++
++void nvkvm_kms_scanout_released(u32 render_handle, u32 stub_handle)
++{
++	if (nvkvm.strict_scanout_release)
++		nvkvm_kms_release_common(render_handle, stub_handle);
+ }
+ 
+ /* Complete anything we are holding, unconditionally.  Every teardown path calls
+@@ -931,7 +954,7 @@
+ 
+ /* Send one framebuffer's present to QEMU.  Runs in process context: the
+  * virtio round-trip inside nvkvm_virtio_present() sleeps. */
+-static void nvkvm_present_send(struct nvkvm_kms *kms,
++static int nvkvm_present_send(struct nvkvm_kms *kms,
+ 			       struct drm_framebuffer *fb)
+ {
+ 	__u32 stub_handle = 0;
+@@ -943,7 +966,7 @@
+ 	 * than caching them at commit time: the reference keeps the proxy GEM
+ 	 * (and so the ctx behind it) alive for exactly as long as we need it. */
+ 	if (!fb || !nvkvm_fb_stub_handle(fb, &stub_handle, &fctx))
+-		return;
++		return -EINVAL;
+ 
+ 	pret = nvkvm_virtio_present(fctx, stub_handle, fb->width, fb->height,
+ 				    fb->pitches[0],
+@@ -960,7 +983,7 @@
+ 		 * frame (nvkvm_present_queue) never reached the host, so it can
+ 		 * never be released and must not be waited for.
+ 		 */
+-		if (fctx && fctx->session) {
++		if (!nvkvm.strict_scanout_release && fctx && fctx->session) {
+ 			spin_lock_irqsave(&kms->pending_lock, flags);
+ 			nvkvm_bp_track(kms, fctx->session->isolate_id,
+ 				       stub_handle);
+@@ -972,25 +995,45 @@
+ 			fb->format ? fb->format->format : 0,
+ 			(unsigned long long)fb->modifier, stub_handle);
+ 	}
++	return pret;
+ }
+ 
+ static void nvkvm_present_work_fn(struct work_struct *w)
+ {
+ 	struct nvkvm_kms *kms = container_of(w, struct nvkvm_kms, present_work);
+ 	struct drm_framebuffer *fb;
++	struct nvkvm_fd_ctx *ctx = NULL;
++	u32 gem = 0;
++	bool previously_held = false;
+ 	unsigned long flags;
+-
+ 	spin_lock_irqsave(&kms->pending_lock, flags);
+ 	fb = kms->pending_fb;
+ 	kms->pending_fb = NULL;
++	if (fb && nvkvm.strict_scanout_release && nvkvm_fb_stub_handle(fb, &gem, &ctx)) {
++		struct nvkvm_bp_buffer *slot = nvkvm_bp_find(kms, ctx->handle_id, gem);
++		if (slot) {
++			previously_held = slot->held;
++			slot->queued = false;
++			/* Publish ownership BEFORE the RPC; an early host release
++			 * must not be overwritten after its acknowledgement. */
++			slot->held = true;
++		}
++	}
+ 	spin_unlock_irqrestore(&kms->pending_lock, flags);
+-
+ 	if (fb) {
+-		nvkvm_present_send(kms, fb);
+-		drm_framebuffer_put(fb);
++		int ret = nvkvm_present_send(kms, fb);
++		struct drm_pending_vblank_event *event = NULL;
+ 		spin_lock_irqsave(&kms->pending_lock, flags);
++		if (ret && ctx && !previously_held) {
++			nvkvm_bp_untrack(kms, ctx->handle_id, gem);
++			if (kms->bp_event && kms->bp_wait_iso == ctx->handle_id &&
++			    kms->bp_wait_gem == gem && !nvkvm_bp_inflight(kms, ctx->handle_id, gem))
++				event = nvkvm_bp_take_event(kms);
++		}
+ 		kms->n_sent++;
+ 		spin_unlock_irqrestore(&kms->pending_lock, flags);
++		nvkvm_bp_send(kms, event);
++		drm_framebuffer_put(fb);
+ 	}
+ }
+ 
+@@ -1014,7 +1057,33 @@
+ 		drm_framebuffer_put(fb);
+ 		return;
+ 	}
++	struct drm_pending_vblank_event *event = NULL;
++	struct nvkvm_fd_ctx *ctx = NULL;
++	u32 gem = 0;
++	if (nvkvm.strict_scanout_release && nvkvm_fb_stub_handle(fb, &gem, &ctx)) {
++		struct nvkvm_bp_buffer *slot = nvkvm_bp_track(kms, ctx->handle_id, gem);
++		if (!slot) {
++			spin_unlock_irqrestore(&kms->pending_lock, flags);
++			drm_framebuffer_put(fb);
++			pr_warn_ratelimited("nvkvm: strict scanout ownership table full; frame not exported\n");
++			return;
++		}
++		slot->queued = true;
++	}
+ 	old = kms->pending_fb;
++	if (nvkvm.strict_scanout_release && old && old != fb &&
++	    nvkvm_fb_stub_handle(old, &gem, &ctx)) {
++		struct nvkvm_bp_buffer *slot = nvkvm_bp_find(kms, ctx->handle_id, gem);
++		if (slot) {
++			slot->queued = false;
++			if (!slot->held) {
++				nvkvm_bp_untrack(kms, ctx->handle_id, gem);
++				if (kms->bp_event && kms->bp_wait_iso == ctx->handle_id &&
++				    kms->bp_wait_gem == gem)
++					event = nvkvm_bp_take_event(kms);
++			}
++		}
++	}
+ 	kms->pending_fb = fb;
+ 	kms->n_queued++;
+ 	if (old)
+@@ -1034,6 +1103,7 @@
+ 	if (report)
+ 		pr_info("nvkvm present: queued=%llu coalesced=%llu sent=%llu stuck=%llu\n",
+ 			q, c, sent, q - c - sent);
++	nvkvm_bp_send(kms, event);
+ 	if (old)
+ 		drm_framebuffer_put(old);
+ }
+@@ -1298,6 +1368,7 @@
+ 	kms = drmm_kzalloc(ddev, sizeof(*kms), GFP_KERNEL);
+ 	if (!kms)
+ 		return -ENOMEM;
++	kms->bp_armed = nvkvm.strict_scanout_release;
+ 
+ 	ret = drmm_mode_config_init(ddev);
+ 	if (ret)
+--- a/src/guest/nvkvm_main.c
++++ b/src/guest/nvkvm_main.c
+@@ -71,6 +71,9 @@
+  * it.  A positive value overrides the probe; exposing more nodes than the
+  * host has just means opens on the extra ones fail.
+  */
++module_param_named(strict_scanout_release, nvkvm.strict_scanout_release, bool, 0444);
++MODULE_PARM_DESC(strict_scanout_release, "negotiated host GPU completion for scanout reuse (research)");
++
+ static bool nvkvm_poll_async;
+ module_param_named(poll_async, nvkvm_poll_async, bool, 0444);
+ MODULE_PARM_DESC(poll_async, "arm host poll notifications off the caller thread (research, default off)");
+--- a/src/guest/nvkvm_virtio.c
++++ b/src/guest/nvkvm_virtio.c
+@@ -556,6 +556,14 @@
+ 				 * Still consume and recycle a host UI event so a mismatched
+ 				 * host cannot wedge VQ_EVT behind an unhandled buffer. */
+ 				(void)ui;
++#endif
++				break;
++			}
++			case NVKVM_EVT_TYPE_SCANOUT_RELEASE: {
++#ifdef NVKVM_GRAPHICS
++				const struct nvkvm_evt_release *rel = (void *)evt;
++				nvkvm_kms_scanout_released(le32_to_cpu(rel->isolate_id),
++					le32_to_cpu(rel->stub_handle));
+ #endif
+ 				break;
+ 			}
+@@ -1015,6 +1023,10 @@
+ 		(virtio_cread64(vdev, offsetof(struct nvkvm_virtio_config, flags)) &
+ 		 (NVKVM_CONFIG_F_SYNC_FILE | NVKVM_CONFIG_F_SYNC_FILE_IMPORT)) ==
+ 		(NVKVM_CONFIG_F_SYNC_FILE | NVKVM_CONFIG_F_SYNC_FILE_IMPORT);
++
++	state->strict_scanout_release = state->sync_file_bridge &&
++		(virtio_cread64(vdev, offsetof(struct nvkvm_virtio_config, flags)) &
++		 NVKVM_CONFIG_F_SCANOUT_RELEASE);
+ 
+ 	if (state->sync_file_bridge)
+ 		pr_info("nvkvm: experimental host sync_file bridge negotiated\n");
+--- a/src/qemu/nvkvm_isolate_handlers.c
++++ b/src/qemu/nvkvm_isolate_handlers.c
+@@ -2088,6 +2088,11 @@
+ 	 * capture/NVENC" container profile — the one that still needs EGL and the
+ 	 * render node, and still needs no display server.
+ 	 */
++	if (nv->strict_scanout_release && nvkvm_display_relay_active()) {
++		close(dmabuf_fd);
++		resp->status = EOPNOTSUPP;
++		return 0;
++	}
+ 	if (nvkvm_display_relay_active()) {
+ 		const char *bcap = getenv("NVKVM_PRESENT_CAPTURE");
+ 
+@@ -2190,7 +2195,7 @@
+ 	 * cache can key on (isolate, bo) instead of colliding two compositors on
+ 	 * bo 1 at the head's single fixed mode.
+ 	 */
+-	if (nvkvm_present_submit(nv, dmabuf_fd, iso_id, req->stub_handle,
++	if (nvkvm_present_submit(nv, dmabuf_fd, iso_id, req->stub_handle, req->handle_id,
+ 				 req->width, req->height,
+ 				 req->pitch, req->format, req->modifier)) {
+ 		resp->status = 0;
+--- a/src/qemu/nvkvm_present_egl.c
++++ b/src/qemu/nvkvm_present_egl.c
+@@ -17,6 +17,7 @@
+  */
+ #include "qemu/osdep.h"
+ #include <time.h>
++#include <linux/sync_file.h>
+ #include "virtio_nvgpu.h"   /* NVKVM_QEMU_GRAPHICS compile-time gate */
+ #include "nvkvm_drm_node.h"
+ 
+@@ -27,6 +28,7 @@
+ #include "ui/dmabuf.h"
+ #include "qapi/error.h"
+ #include "qemu/main-loop.h"
++#include "qemu/timer.h"
+ #include "hw/core/qdev.h"
+ #include "nvkvm_log.h"
+ #include "nvkvm_udmabuf.h"
+@@ -353,6 +355,11 @@
+      * (and its fd open) until a newer frame replaces it, like virtio-gpu's
+      * primary dmabuf. */
+     QemuDmaBuf *cur_buf;
++    uint32_t context, cur_context, cur_key;
++    GList *releases;
++    QEMUTimer *release_timer;
++    unsigned release_count;
++    uint64_t release_gpu, release_dropped, release_errors;
+ 
+     uint32_t key;            /* guest scanout bo this frame came from */
+     uint32_t owner;          /* isolate that exported it (S-4) */
+@@ -624,9 +631,98 @@
+ }
+ 
+ 
++/* Strict SDL mode: the source is reusable only after its last host GPU
++ * read completes. The queue also retains completed notifications while VQ_EVT
++ * is full. A device-owned timer retries; no delayed BH can outlive teardown. */
++typedef struct NvkvmGpuRelease {
++    uint32_t context, key;
++    int fd;
++    bool ready, failed;
++} NvkvmGpuRelease;
++
++static void nvkvm_release_poll(void *opaque)
++{
++    NvkvmPresent *p = opaque;
++    for (GList *node = p->releases, *next; node; node = next) {
++        next = node->next;
++        NvkvmGpuRelease *r = node->data;
++        if (!r->ready && !r->failed) {
++            struct sync_file_info info = {0};
++            int ret = ioctl(r->fd, SYNC_IOC_FILE_INFO, &info);
++            if (!ret && info.status == 1) {
++                close(r->fd);
++                r->fd = -1;
++                r->ready = true;
++                p->release_gpu++;
++            } else if (ret < 0 || info.status < 0) {
++                r->failed = true;
++                p->release_errors++;
++                error_report("nvkvm: host read fence failed; source buffer remains owned");
++            }
++        }
++        if (r->ready && nvkvm_virtio_try_scanout_release(p->nv, r->context, r->key)) {
++            p->releases = g_list_delete_link(p->releases, node);
++            p->release_count--;
++            g_free(r);
++        }
++    }
++    if (p->releases)
++        timer_mod(p->release_timer, qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 1);
++}
++
++static void nvkvm_release_queue(NvkvmPresent *p, uint32_t context, uint32_t key, int fd, bool ready)
++{
++    if (!p->nv->strict_scanout_release || !context || !key) {
++        if (fd >= 0) close(fd);
++        return;
++    }
++    if (p->release_count >= 128) {
++        if (fd >= 0) close(fd);
++        p->release_errors++;
++        error_report("nvkvm: host release queue full; source buffers remain owned");
++        return;
++    }
++    NvkvmGpuRelease *r = g_new0(NvkvmGpuRelease, 1);
++    r->context = context;
++    r->key = key;
++    r->fd = fd;
++    r->ready = ready;
++    p->releases = g_list_prepend(p->releases, r);
++    p->release_count++;
++    if (ready) p->release_dropped++;
++    timer_mod(p->release_timer, qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 1);
++}
++
++static void nvkvm_release_after_gpu(NvkvmPresent *p, uint32_t context, uint32_t key)
++{
++    EGLDisplay display = eglGetCurrentDisplay();
++    if (display == EGL_NO_DISPLAY || !epoxy_has_egl_extension(display, "EGL_ANDROID_native_fence_sync")) {
++        p->release_errors++;
++        error_report("nvkvm: current display cannot export a GPU read fence; buffer remains owned");
++        return;
++    }
++    const EGLint attrs[] = { EGL_NONE };
++    EGLSyncKHR sync = eglCreateSyncKHR(display, EGL_SYNC_NATIVE_FENCE_ANDROID, attrs);
++    if (sync == EGL_NO_SYNC_KHR) {
++        p->release_errors++;
++        error_report("nvkvm: host GPU read fence creation failed; buffer remains owned");
++        return;
++    }
++    glFlush();
++    int fd = eglDupNativeFenceFDANDROID(display, sync);
++    eglDestroySyncKHR(display, sync);
++    if (fd < 0) {
++        p->release_errors++;
++        error_report("nvkvm: host GPU read fence export failed; buffer remains owned");
++        return;
++    }
++    nvkvm_release_queue(p, context, key, fd, false);
++}
++
+ /* Push the pending frame to the GL console with no CPU copy. */
+ static bool nvkvm_present_gl(NvkvmPresent *p, int fd, uint32_t w, uint32_t h,
+-                             uint32_t stride, uint32_t fourcc, uint64_t mod)
++                             uint32_t stride, uint32_t fourcc, uint64_t mod,
++                             uint32_t context, uint32_t key)
+ {
+     /* qemu_dmabuf_new takes ownership of fd (freed by qemu_dmabuf_close).
+      * 11.1: offset/stride/fd are arrays with an explicit plane count now; the
+@@ -663,6 +759,9 @@
+          * leak of driver-side objects, and it is one call to stop it.
+          */
+         qemu_console_gl_release_dmabuf(p->con, p->cur_buf);
++        if (p->nv->strict_scanout_release &&
++            (p->cur_context != context || p->cur_key != key))
++            nvkvm_release_after_gpu(p, p->cur_context, p->cur_key);
+         qemu_dmabuf_close(p->cur_buf);
+         qemu_dmabuf_free(p->cur_buf);
+     }
+@@ -675,6 +774,8 @@
+     }
+     egl_fb_destroy(&p->fb);
+     p->cur_buf = buf;
++    p->cur_context = context;
++    p->cur_key = key;
+     return true;
+ }
+ 
+@@ -1544,6 +1645,7 @@
+         uint32_t w      = p->w, h = p->h, stride = p->stride;
+         uint32_t fourcc = p->fourcc;
+         uint64_t gmod   = p->modifier;
++        uint32_t context = p->context, key = p->key;
+         p->fd    = -1;
+         p->dirty = false;
+         pthread_mutex_unlock(&p->lock);
+@@ -1553,12 +1655,24 @@
+         if (stats) {
+             clock_gettime(CLOCK_MONOTONIC, &ta);
+         }
+-        bool shown = nvkvm_present_gl(p, fd, w, h, stride, fourcc, gmod);
++        bool shown = nvkvm_present_gl(p, fd, w, h, stride, fourcc, gmod, context, key);
+         if (stats) {
+             clock_gettime(CLOCK_MONOTONIC, &tb);
+             nvkvm_st_frame((tb.tv_sec - ta.tv_sec) * 1e6 +
+                            (tb.tv_nsec - ta.tv_nsec) / 1e3, shown);
+         }
++    } else if (p->nv->strict_scanout_release) {
++        /* UI context may not exist on the first update. No readback fallback:
++         * this frame was not consumed, so it can be released and retried. */
++        pthread_mutex_lock(&p->lock);
++        if (p->fd >= 0) {
++            close(p->fd);
++            if (p->context != p->cur_context || p->key != p->cur_key)
++                nvkvm_release_queue(p, p->context, p->key, -1, true);
++            p->fd = -1;
++            p->dirty = false;
++        }
++        pthread_mutex_unlock(&p->lock);
+     } else {
+         /* Readback: wake the present thread, which drains the slot itself. */
+         if (nvkvm_present_thread_start(p)) {
+@@ -1707,6 +1821,8 @@
+     p->mode = -1;
+     p->dev  = dev;
+     p->nv   = nv;
++    if (nv->strict_scanout_release)
++        p->release_timer = timer_new_ms(QEMU_CLOCK_REALTIME, nvkvm_release_poll, p);
+     p->con  = qemu_graphic_console_create(dev, 0, &nvkvm_present_hwops, p);
+     p->bh   = qemu_bh_new(nvkvm_present_bh, p);
+     qemu_sem_init(&p->wake, 0);   /* #125: present thread starts on first use */
+@@ -1737,6 +1853,18 @@
+         return;
+     }
+     nv->present_ctx = NULL;
++    if (p->release_timer) {
++        timer_del(p->release_timer);
++        timer_free(p->release_timer);
++        for (GList *node = p->releases; node; node = node->next) {
++            NvkvmGpuRelease *r = node->data;
++            if (r->fd >= 0) close(r->fd);
++            g_free(r);
++        }
++        g_list_free(p->releases);
++        fprintf(stderr, "nvkvm strict releases: gpu=%" PRIu64 " unconsumed=%" PRIu64 " errors=%" PRIu64 "\n",
++                p->release_gpu, p->release_dropped, p->release_errors);
++    }
+     /* #125: stop the present thread before tearing anything it touches down. */
+     if (p->thread_started) {
+         qatomic_set(&p->thread_stop, true);
+@@ -1844,7 +1972,7 @@
+ }
+ 
+ bool nvkvm_present_submit(struct VirtIONvgpu *nv, int dmabuf_fd,
+-                          uint32_t owner_isolate_id, uint32_t buf_key,
++                          uint32_t owner_isolate_id, uint32_t buf_key, uint32_t render_handle,
+                           uint32_t width, uint32_t height, uint32_t stride,
+                           uint32_t fourcc, uint64_t modifier)
+ {
+@@ -1856,6 +1984,10 @@
+ 
+     pthread_mutex_lock(&p->lock);
+     if (p->fd >= 0) {
++        if (nv->strict_scanout_release &&
++            (p->context != render_handle || p->key != buf_key) &&
++            (p->context != p->cur_context || p->key != p->cur_key))
++            nvkvm_release_queue(p, p->context, p->key, -1, true);
+         close(p->fd);        /* drop the frame the display hasn't taken yet */
+         if (nvkvm_disp_stats()) {
+             qatomic_inc(&nvkvm_st_dropped);
+@@ -1864,6 +1996,7 @@
+     }
+     p->fd       = dmabuf_fd;
+     p->owner    = owner_isolate_id;   /* S-4: half of the cache identity */
++    p->context  = render_handle;
+     p->key      = buf_key;
+     p->w        = width;
+     p->h        = height;
+@@ -2003,12 +2136,12 @@
+     (void)nv; (void)dev;
+ }
+ bool nvkvm_present_submit(struct VirtIONvgpu *nv, int dmabuf_fd,
+-                          uint32_t owner_isolate_id, uint32_t buf_key,
++                          uint32_t owner_isolate_id, uint32_t buf_key, uint32_t render_handle,
+                           uint32_t width, uint32_t height, uint32_t stride,
+                           uint32_t fourcc, uint64_t modifier)
+ {
+     (void)nv; (void)dmabuf_fd; (void)owner_isolate_id; (void)buf_key;
+-    (void)width; (void)height;
++    (void)render_handle; (void)width; (void)height;
+     (void)stride; (void)fourcc; (void)modifier;
+     return false;            /* not accepted → caller closes the fd */
+ }
+--- a/src/qemu/nvkvm_present_egl.h
++++ b/src/qemu/nvkvm_present_egl.h
+@@ -68,7 +68,7 @@
+                                    uint64_t modifier);
+ 
+ bool nvkvm_present_submit(struct VirtIONvgpu *nv, int dmabuf_fd,
+-                          uint32_t owner_isolate_id, uint32_t buf_key,
++                          uint32_t owner_isolate_id, uint32_t buf_key, uint32_t render_handle,
+                           uint32_t width, uint32_t height, uint32_t stride,
+                           uint32_t fourcc, uint64_t modifier);
+ 
+--- a/src/qemu/virtio_nvgpu.c
++++ b/src/qemu/virtio_nvgpu.c
+@@ -954,6 +954,27 @@
+ 	p->isolate_id  = isolate_id;
+ 	p->stub_handle = stub_handle;
+ 	aio_bh_schedule_oneshot(qemu_get_aio_context(), nvkvm_release_push_bh, p);
++}
++
++/* Strict releases are proofs, not pacing hints. Caller retains and retries
++ * when VQ_EVT has no free descriptor; no allocated BH can outlive the device. */
++bool nvkvm_virtio_try_scanout_release(VirtIONvgpu *nv, uint32_t render_handle, uint32_t gem)
++{
++	assert(bql_locked());
++	if (!nv || !nv->strict_scanout_release || !nv->vq_evt)
++		return false;
++	VirtQueueElement *elem = virtqueue_pop(nv->vq_evt, sizeof(*elem));
++	if (!elem)
++		return false;
++	struct nvkvm_evt_release msg = {
++		.isolate_id = cpu_to_le32(render_handle),
++		.stub_handle = cpu_to_le32(gem),
++		.type = cpu_to_le32(NVKVM_EVT_TYPE_SCANOUT_RELEASE),
++	};
++	virtqueue_push(nv->vq_evt, elem, iov_from_buf(elem->in_sg, elem->in_num, 0, &msg, sizeof(msg)));
++	virtio_notify(VIRTIO_DEVICE(nv), nv->vq_evt);
++	g_free(elem);
++	return true;
+ }
+ 
+ /* Opt-in diagnostic counters. VQ dispatch is serialized by the BQL. */
+@@ -1367,6 +1388,10 @@
+ 	VirtIODevice *vdev = VIRTIO_DEVICE(dev);
+ 	VirtIONvgpu  *nv   = VIRTIO_NVGPU(dev);
+ 
++	if (nv->strict_scanout_release && (!nv->graphics || !nv->sync_file_bridge)) {
++		error_setg(errp, "strict-scanout-release requires graphics and sync-file-bridge");
++		return;
++	}
+ 	nvkvm_debug_enabled = (getenv("NVKVM_DEBUG") != NULL);
+ 
+ 	g_nvkvm_device = nv;
+@@ -1659,7 +1684,8 @@
+ 	nv->config_space.flags = cpu_to_le64(
+ 		(nv->graphics ? NVKVM_CONFIG_F_GRAPHICS : 0) |
+ 		(nv->graphics && nv->sync_file_bridge ?
+-		 (NVKVM_CONFIG_F_SYNC_FILE | NVKVM_CONFIG_F_SYNC_FILE_IMPORT) : 0));
++		 (NVKVM_CONFIG_F_SYNC_FILE | NVKVM_CONFIG_F_SYNC_FILE_IMPORT) : 0) |
++		(nv->strict_scanout_release ? NVKVM_CONFIG_F_SCANOUT_RELEASE : 0));
+ 	if (!nv->graphics)
+ 		info_report("nvkvm: graphics disabled (compute-only): DRM render "
+ 			    "node + NVKMS modeset device + ioctls refused");
+@@ -1872,6 +1898,7 @@
+ 	 * NVKMS modeset device. off → compute-only VM, smaller attack surface. */
+ 	DEFINE_PROP_BOOL("graphics", VirtIONvgpu, graphics, true),
+ 	DEFINE_PROP_BOOL("sync-file-bridge", VirtIONvgpu, sync_file_bridge, false),
++	DEFINE_PROP_BOOL("strict-scanout-release", VirtIONvgpu, strict_scanout_release, false),
+ };
+ 
+ static void virtio_nvgpu_class_init(ObjectClass *klass, const void *data)
+--- a/src/qemu/virtio_nvgpu.h
++++ b/src/qemu/virtio_nvgpu.h
+@@ -298,6 +298,7 @@
+ 	 * device opens + ioctls) regardless of the untrusted guest. */
+ 	bool                graphics;
+ 	bool                sync_file_bridge;
++	bool                strict_scanout_release;
+ 
+ 	/*
+ 	 * The isolation mode actually in force, resolved at realize (mode `auto`
+@@ -514,6 +515,7 @@
+ int nvkvm_req_munmap_on_isolate(VirtIONvgpu *nv,
+ 				 struct nvkvm_req_munmap_on_isolate *req,
+ 				 struct nvkvm_resp_munmap_on_isolate *resp);
++bool nvkvm_virtio_try_scanout_release(VirtIONvgpu *nv, uint32_t render_handle, uint32_t gem);
+ int nvkvm_req_export_sync_file(VirtIONvgpu *nv,
+     struct nvkvm_req_export_sync_file *req,
+     struct nvkvm_resp_export_sync_file *resp);

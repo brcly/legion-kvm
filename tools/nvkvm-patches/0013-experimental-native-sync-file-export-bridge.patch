@@ -1,0 +1,1221 @@
+--- a/src/common/nvkvm_isolate_proto.h
++++ b/src/common/nvkvm_isolate_proto.h
+@@ -17,6 +17,7 @@
+ #define NVKVM_ISOLATE_PROTO_H
+ 
+ #include <stdint.h>
++#include "nvkvm_sync_file_abi.h"
+ 
+ /*
+  * NVKMS wrapper ioctl on /dev/nvidia-modeset (NVKVM_DEV_MODESET).  Mirrors the
+@@ -57,6 +58,7 @@
+ #define ISOLATE_CMD_PRESENT_EXPORT 14 /* PRIME_HANDLE_TO_FD a GEM; reply w/ dma-buf via SCM */
+ #define ISOLATE_CMD_XISO_IMPORT  15   /* #110 cross-isolate: PRIME_FD_TO_HANDLE a dma-buf
+ 				       * (arrives via SCM_RIGHTS) → reply w/ GEM handle */
++#define ISOLATE_CMD_EXPORT_SYNC_FILE 17 /* canonical SEMSURF fence export + SCM_RIGHTS */
+ #define ISOLATE_CMD_WINDOW_INFO  16   /* U-9: report the guest-mapping window's base+size */
+ 
+ /* ── Response types (isolate → QEMU) ────────────────────────────────────── */
+@@ -192,6 +194,18 @@
+ };
+ 
+ /* ── POLL ────────────────────────────────────────────────────────────────── */
++
++/* Uses the serialized OPEN_DEVICE fd-response slot; output handle is minted
++ * by QEMU before dispatch, so the stub can store the native fd immediately. */
++struct isolate_cmd_export_sync_file {
++	uint32_t type;
++	uint32_t render_handle;
++	uint32_t output_handle;
++	uint32_t fence_context_handle;
++	uint32_t timeout_ms;
++	uint32_t reserved;
++	uint64_t wait_value;
++};
+ 
+ struct isolate_cmd_poll {
+ 	uint32_t type;        /* ISOLATE_CMD_POLL */
+--- a/src/common/nvkvm_proto.h
++++ b/src/common/nvkvm_proto.h
+@@ -64,6 +64,8 @@
+  *   compute-only VMs — shrinks the guest device + host attack surface.
+  */
+ #define NVKVM_CONFIG_F_GRAPHICS  (1ULL << 0)
++/* Real host sync_file export/status transport; graphics-gated, opt-in. */
++#define NVKVM_CONFIG_F_SYNC_FILE (1ULL << 1)
+ 
+ /* ── Protocol version ────────────────────────────────────────────────────── */
+ 
+@@ -101,6 +103,7 @@
+ #define NVKVM_DEV_UVM        1          /* /dev/nvidia-uvm               */
+ #define NVKVM_DEV_GPU(n)     (16 + (n)) /* /dev/nvidia0 → /dev/nvidia15  */
+ #define NVKVM_DEV_DRM_RD(n)  (32 + (n)) /* /dev/dri/renderD128+n (nvidia-drm) */
++#include "nvkvm_sync_file_abi.h" /* export-only sync_file; no GPU ioctls */
+ #define NVKVM_DEV_MODESET    48         /* /dev/nvidia-modeset (NVKMS)    */
+ 
+ /*
+@@ -179,6 +182,8 @@
+ 	NVKVM_REQ_XISO_IMPORT             = 31, /* #110 cross-isolate dma-buf: broker a bo from
+ 	                                           * the owner isolate into the caller's; returns
+ 	                                           * the caller-local stub GEM handle            */
++	NVKVM_REQ_EXPORT_SYNC_FILE = 32,
++	NVKVM_REQ_SYNC_FILE_STATUS = 33,
+ };
+ 
+ /* ── Generic header ──────────────────────────────────────────────────────── */
+@@ -507,6 +512,27 @@
+ };
+ 
+ /* ── POLL_ON_ISOLATE ─────────────────────────────────────────────────────── */
++
++/* Export a fence from an owned render file. No descriptor numbers cross VMs. */
++struct nvkvm_req_export_sync_file {
++	__le32 isolate_id;
++	__le32 handle_id;
++	__le32 fence_context_handle;
++	__le32 timeout_ms;
++	__le64 wait_value;
++};
++struct nvkvm_resp_export_sync_file {
++	__le32 handle_id;
++	__le32 status;
++};
++struct nvkvm_req_sync_file_status {
++	__le32 isolate_id;
++	__le32 handle_id;
++};
++struct nvkvm_resp_sync_file_status {
++	__le32 status;       /* transport error, never a GPU completion */
++	__le32 fence_status; /* signed: 0 pending, 1 complete, -errno GPU error */
++};
+ 
+ struct nvkvm_req_poll_on_isolate {
+ 	__le32 isolate_id;
+--- /dev/null
++++ b/src/common/nvkvm_sync_file_abi.h
+@@ -0,0 +1,7 @@
++/* SPDX-License-Identifier: GPL-2.0 OR Apache-2.0 */
++#ifndef NVKVM_SYNC_FILE_ABI_H
++#define NVKVM_SYNC_FILE_ABI_H
++#define NVKVM_DEV_SYNC_FILE 254u
++/* drm_nvidia_semsurf_fence_create_params: 24 bytes, OUT fd at byte 16. */
++#define NVKVM_SYNC_FILE_FENCE_CREATE 0xc0186455u
++#endif
+--- a/src/guest/Kbuild
++++ b/src/guest/Kbuild
+@@ -21,6 +21,7 @@
+ # the resulting .ko has no DRM/KMS/modeset code at all — the nvproxy-equivalent.
+ ifneq ($(NVKVM_GRAPHICS),0)
+ ccflags-y += -DNVKVM_GRAPHICS
+-nvkvm-guest-objs += nvkvm_drm.o \
++nvkvm-guest-objs += nvkvm_sync_file.o \
++                    nvkvm_drm.o \
+                     nvkvm_kms.o
+ endif
+--- a/src/guest/nvkvm.h
++++ b/src/guest/nvkvm.h
+@@ -397,6 +397,7 @@
+ 	/* Graphics enabled by QEMU (NVKVM_CONFIG_F_GRAPHICS); read at probe.
+ 	 * When false the guest tears down modeset + skips the DRM render node. */
+ 	bool           graphics_enabled;
++	bool sync_file_bridge;
+ 
+ 	/* Session management */
+ 	struct mutex   sessions_lock;
+@@ -557,6 +558,20 @@
+ 				 __u32 *isolate_id_out);
+ /* #127: ask the host to relay an os-event fd's readiness (POLLIN) over VQ_EVT.
+  * arm!=0 starts polling; arm==0 stops. Control-plane (does not block on GPU). */
++int nvkvm_virtio_export_sync_file(struct nvkvm_fd_ctx *owner,
++    __u32 fence_context, __u32 timeout_ms, __u64 wait_value, __u32 *handle);
++int nvkvm_virtio_sync_file_status(struct nvkvm_fd_ctx *ctx, int *status);
++struct nvkvm_fd_ctx *nvkvm_fd_ctx_adopt_sync_file(
++    struct nvkvm_fd_ctx *owner, __u32 handle);
++#ifdef NVKVM_GRAPHICS
++struct dma_fence;
++int nvkvm_sync_file_init(void);
++void nvkvm_sync_file_fini(void);
++struct dma_fence *nvkvm_sync_fence_export(struct nvkvm_fd_ctx *owner,
++    __u32 fence_context, __u32 timeout_ms, __u64 wait_value);
++int nvkvm_sync_file_export(struct nvkvm_fd_ctx *owner,
++    __u32 fence_context, __u32 timeout_ms, __u64 wait_value);
++#endif
+ int  nvkvm_virtio_poll_arm(__u32 isolate_id, __u32 handle_id, int arm);
+ int  nvkvm_virtio_setup_ring(unsigned int session_id, u64 *ring_gpa_out,
+ 			     u32 *ring_bytes_out);
+--- a/src/guest/nvkvm_drm.c
++++ b/src/guest/nvkvm_drm.c
+@@ -39,6 +39,12 @@
+ #include <drm/drm_framebuffer.h>        /* #102: fb->obj[] for the present path */
+ #include <drm/drm_prime.h>              /* #110: get_sg_table for dma-buf import */
+ #include <linux/scatterlist.h>
++#include <linux/dma-fence.h>
++#include <linux/dma-resv.h>
++#include <linux/dma-fence-chain.h>
++#include <linux/sync_file.h>
++#include <linux/file.h>
++#include <drm/drm_syncobj.h>
+ 
+ #include "nvkvm.h"
+ /* GET_DEV_INFO's params struct is version-keyed — four measured layouts across
+@@ -657,7 +663,12 @@
+ 	primary_index = *(__u32 *)(p + lay.primary_index_off);
+ 	if (dev && dev->primary)
+ 		primary_index = (unsigned)dev->primary->index;
++	bool native_sync_file = lay.supports_sync_fd_off >= 0 &&
++		*(__u32 *)(p + lay.supports_sync_fd_off) == 1;
+ 	nvkvm_drm_devinfo_fixup(lay, p, primary_index);
++	if (nvkvm.sync_file_bridge && native_sync_file)
++		*(__u32 *)(p + lay.supports_sync_fd_off) = 1;
++
+ 	return 0;
+ }
+ NVKVM_DRM_FWD(dmabuf_supported, DRM_IO(NVKVM_DRM_COMMAND_BASE + 0x0f))
+@@ -694,30 +705,125 @@
+  * sync-fd passback is a separate milestone.)
+  */
+ static int nvkvm_drm_fwd_semsurf_fence_create(struct drm_device *dev,
+-					      void *data,
+-					      struct drm_file *file)
++    void *data, struct drm_file *file)
+ {
+ 	struct drm_nvidia_semsurf_fence_create_params *p = data;
+ 	struct nvkvm_fd_ctx *ctx = file->driver_priv;
+-	unsigned int cmd = DRM_IOWR(NVKVM_DRM_COMMAND_BASE + 0x15,
+-				    struct drm_nvidia_semsurf_fence_create_params);
+-	__u32 guest_h = p->fence_context_handle;
+-	__u32 stub_h;
+-	__u64 fault = 0;
+-	long r;
+-
+ 	(void)dev;
+-	if (!ctx)
+-		return -EBADF;
+-	stub_h = nvkvm_gem_to_stub(file, guest_h);
+-	if (stub_h)
+-		p->fence_context_handle = stub_h;
+-
+-	r = nvkvm_virtio_ioctl_on_isolate(ctx, cmd, data, sizeof(*p),
+-					  NULL, 0, 0, &fault);
+-
+-	p->fence_context_handle = guest_h;   /* round-trip the caller's handle */
+-	return (r < 0) ? (int)r : 0;
++	if (!ctx || !nvkvm.sync_file_bridge)
++		return -EOPNOTSUPP;
++	__u32 context = nvkvm_gem_to_stub(file, p->fence_context_handle);
++	if (!context)
++		return -ENOENT;
++	int fd = nvkvm_sync_file_export(ctx, context, p->timeout_value_ms, p->wait_value);
++	if (fd < 0)
++		return fd;
++	p->fd = fd;
++	return 0;
++}
++
++struct nvkvm_semsurf_fence_attach_params {
++	__u32 handle, fence_context_handle, timeout_ms, shared;
++	__u64 wait_value;
++};
++
++static int nvkvm_drm_fwd_semsurf_fence_attach(struct drm_device *dev,
++    void *data, struct drm_file *file)
++{
++	struct nvkvm_semsurf_fence_attach_params *p = data;
++	struct nvkvm_fd_ctx *ctx = file->driver_priv;
++	if (!ctx || !nvkvm.sync_file_bridge)
++		return -EOPNOTSUPP;
++	if (p->shared > 1)
++		return -EINVAL;
++	__u32 context = nvkvm_gem_to_stub(file, p->fence_context_handle);
++	if (!context)
++		return -ENOENT;
++	struct drm_gem_object *object = drm_gem_object_lookup(file, p->handle);
++	if (!object)
++		return -ENOENT;
++	struct dma_fence *fence = nvkvm_sync_fence_export(ctx, context, p->timeout_ms, p->wait_value);
++	if (IS_ERR(fence)) {
++		drm_gem_object_put(object);
++		return PTR_ERR(fence);
++	}
++	int ret = dma_resv_lock(object->resv, NULL);
++	if (!ret) {
++		ret = dma_resv_reserve_fences(object->resv, 1);
++		if (!ret)
++			dma_resv_add_fence(object->resv, fence,
++				p->shared ? DMA_RESV_USAGE_READ : DMA_RESV_USAGE_WRITE);
++		dma_resv_unlock(object->resv);
++	}
++	dma_fence_put(fence);
++	drm_gem_object_put(object);
++	return ret;
++}
++
++struct nvkvm_semsurf_export_point_params {
++	__u32 fence_context_handle, syncobj_handle;
++	__u64 wait_value, syncobj_point;
++};
++
++static int nvkvm_drm_export_syncobj_point(struct drm_device *dev,
++    void *data, struct drm_file *file)
++{
++	struct nvkvm_semsurf_export_point_params *p = data;
++	struct nvkvm_fd_ctx *ctx = file->driver_priv;
++	if (!ctx || !nvkvm.sync_file_bridge)
++		return -EOPNOTSUPP;
++	__u32 context = nvkvm_gem_to_stub(file, p->fence_context_handle);
++	if (!context)
++		return -ENOENT;
++	struct drm_syncobj *syncobj = drm_syncobj_find(file, p->syncobj_handle);
++	if (!syncobj)
++		return -ENOENT;
++	struct dma_fence_chain *chain = dma_fence_chain_alloc();
++	if (!chain) {
++		drm_syncobj_put(syncobj);
++		return -ENOMEM;
++	}
++	struct dma_fence *fence = nvkvm_sync_fence_export(ctx, context, 0, p->wait_value);
++	int ret = 0;
++	if (IS_ERR(fence)) {
++		ret = PTR_ERR(fence);
++		dma_fence_chain_free(chain);
++	} else {
++		drm_syncobj_add_point(syncobj, chain, fence, p->syncobj_point);
++		dma_fence_put(fence);
++	}
++	drm_syncobj_put(syncobj);
++	return ret;
++}
++
++struct nvkvm_syncobj_get_syncfd_params {
++	__u32 syncobj_handle;
++	__s32 fd;
++	__u64 syncobj_point;
++};
++
++static int nvkvm_drm_syncobj_get_syncfd(struct drm_device *dev,
++    void *data, struct drm_file *file)
++{
++	struct nvkvm_syncobj_get_syncfd_params *p = data;
++	struct dma_fence *fence;
++	if (!nvkvm.sync_file_bridge)
++		return -EOPNOTSUPP;
++	int ret = drm_syncobj_find_fence(file, p->syncobj_handle, p->syncobj_point, 0, &fence);
++	if (ret)
++		return ret;
++	struct sync_file *sync = sync_file_create(fence);
++	dma_fence_put(fence);
++	if (!sync)
++		return -ENOMEM;
++	int fd = get_unused_fd_flags(O_CLOEXEC);
++	if (fd < 0) {
++		fput(sync->file);
++		return fd;
++	}
++	fd_install(fd, sync->file);
++	p->fd = fd;
++	return 0;
+ }
+ 
+ /*
+@@ -1076,6 +1182,15 @@
+ 				   struct drm_nvidia_semsurf_fence_create_params),
+ 		   .func = nvkvm_drm_fwd_semsurf_fence_create,
+ 		   .flags = DRM_RENDER_ALLOW, .name = "NVIDIA_SEMSURF_FENCE_CREATE" },
++	[0x17] = { .cmd = DRM_IOW(NVKVM_DRM_COMMAND_BASE + 0x17, struct nvkvm_semsurf_fence_attach_params),
++	  .func = nvkvm_drm_fwd_semsurf_fence_attach,
++	  .flags = DRM_RENDER_ALLOW, .name = "NVIDIA_SEMSURF_FENCE_ATTACH" },
++	[0x1d] = { .cmd = DRM_IOW(NVKVM_DRM_COMMAND_BASE + 0x1d, struct nvkvm_semsurf_export_point_params),
++	  .func = nvkvm_drm_export_syncobj_point, .flags = DRM_RENDER_ALLOW,
++	  .name = "NVIDIA_SEMSURF_EXPORT_TO_SYNCOBJ_POINT" },
++	[0x1e] = { .cmd = DRM_IOWR(NVKVM_DRM_COMMAND_BASE + 0x1e, struct nvkvm_syncobj_get_syncfd_params),
++	  .func = nvkvm_drm_syncobj_get_syncfd, .flags = DRM_RENDER_ALLOW,
++	  .name = "NVIDIA_SYNCOBJ_GET_SYNCFD" },
+ };
+ 
+ /* #124: the virtual KMS head (nvkvm_kms.c) lives on this same drm_device, so the
+--- a/src/guest/nvkvm_main.c
++++ b/src/guest/nvkvm_main.c
+@@ -774,6 +774,34 @@
+ 	nvkvm_session_put(ctx->session);
+ 	kfree(ctx);
+ 	return ERR_PTR(ret);
++}
++
++/* Adopt a host-created sync_file in the exporting file's existing principal.
++ * This pins the session, never its DRM file/GEM table (which avoids cycles). */
++struct nvkvm_fd_ctx *nvkvm_fd_ctx_adopt_sync_file(
++    struct nvkvm_fd_ctx *owner, __u32 handle)
++{
++	struct nvkvm_fd_ctx *ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
++	if (!ctx)
++		return ERR_PTR(-ENOMEM);
++	ctx->dev_id = NVKVM_DEV_SYNC_FILE;
++	ctx->handle_id = handle;
++	refcount_set(&ctx->refs, 1);
++	ctx->session = owner->session;
++	mutex_lock(&nvkvm.sessions_lock);
++	ctx->session->refcount++;
++	mutex_unlock(&nvkvm.sessions_lock);
++	INIT_WORK(&ctx->poll_work, nvkvm_poll_arm_work);
++	init_waitqueue_head(&ctx->poll_wq);
++	atomic_set(&ctx->poll_events, 0);
++	atomic_set(&ctx->poll_armed, 0);
++	spin_lock_init(&ctx->mmap_lock);
++	INIT_LIST_HEAD(&ctx->mmap_regions);
++	mutex_init(&ctx->cpu_pages_lock);
++	INIT_LIST_HEAD(&ctx->cpu_pages);
++	INIT_LIST_HEAD(&ctx->evt_node);
++	nvkvm_evt_ctx_register(ctx);
++	return ctx;
+ }
+ 
+ /* Actual teardown — runs only when the last reference (open file + any proxy
+@@ -3501,15 +3529,26 @@
+ 	mutex_init(&nvkvm.sessions_lock);
+ 	idr_init(&nvkvm.sessions_idr);
+ 
++#ifdef NVKVM_GRAPHICS
++	ret = nvkvm_sync_file_init();
++	if (ret)
++		return ret;
++#endif
+ 	ret = register_virtio_driver(&nvkvm_virtio_driver);
+ 	if (ret) {
+ 		pr_err("nvkvm: failed to register virtio driver: %d\n", ret);
++#ifdef NVKVM_GRAPHICS
++		nvkvm_sync_file_fini();
++#endif
+ 		return ret;
+ 	}
+ 
+ 	ret = register_devices();
+ 	if (ret) {
+ 		unregister_virtio_driver(&nvkvm_virtio_driver);
++#ifdef NVKVM_GRAPHICS
++		nvkvm_sync_file_fini();
++#endif
+ 		return ret;
+ 	}
+ 
+@@ -3524,6 +3563,9 @@
+ 	nvkvm_hostfile_exit();
+ 	unregister_devices();
+ 	unregister_virtio_driver(&nvkvm_virtio_driver);
++#ifdef NVKVM_GRAPHICS
++	nvkvm_sync_file_fini();
++#endif
+ 	idr_destroy(&nvkvm.sessions_idr);
+ 	pr_info("nvkvm: module unloaded\n");
+ }
+--- /dev/null
++++ b/src/guest/nvkvm_sync_file.c
+@@ -0,0 +1,165 @@
++// SPDX-License-Identifier: GPL-2.0
++/* Actual host sync_files behind guest DMA fences. Experimental, feature gated. */
++#include <linux/dma-fence.h>
++#include <linux/file.h>
++#include <linux/jiffies.h>
++#include <linux/module.h>
++#include <linux/slab.h>
++#include <linux/sync_file.h>
++#include <linux/workqueue.h>
++#include "nvkvm.h"
++
++static struct workqueue_struct *sync_wq;
++
++struct nvkvm_sync_fence {
++	struct dma_fence base;
++	spinlock_t lock;
++	struct nvkvm_fd_ctx *ctx;
++	struct work_struct poll_work;
++	struct work_struct cleanup;
++};
++
++static const char *sync_driver_name(struct dma_fence *fence)
++{
++	return "nvkvm";
++}
++
++static const char *sync_timeline_name(struct dma_fence *fence)
++{
++	return "host.sync_file";
++}
++
++static bool sync_enable_signaling(struct dma_fence *fence)
++{
++	/* Monitoring begins at creation, independent of the first consumer. */
++	return true;
++}
++
++static void sync_cleanup(struct work_struct *work)
++{
++	struct nvkvm_sync_fence *nf = container_of(work, struct nvkvm_sync_fence, cleanup);
++	/* A final put from poll_work can queue us before that worker returns. */
++	cancel_work_sync(&nf->poll_work);
++	nvkvm_fd_ctx_close(nf->ctx);
++	dma_fence_free(&nf->base);
++	/* Module exit drains sync_wq before code can be unmapped. */
++	module_put(THIS_MODULE);
++}
++
++static void sync_release(struct dma_fence *fence)
++{
++	struct nvkvm_sync_fence *nf = container_of(fence, struct nvkvm_sync_fence, base);
++	queue_work(sync_wq, &nf->cleanup);
++}
++
++static const struct dma_fence_ops sync_ops = {
++	.get_driver_name = sync_driver_name,
++	.get_timeline_name = sync_timeline_name,
++	.enable_signaling = sync_enable_signaling,
++	.release = sync_release,
++};
++
++static void sync_poll(struct work_struct *work)
++{
++	struct nvkvm_sync_fence *nf = container_of(work, struct nvkvm_sync_fence, poll_work);
++	struct nvkvm_fd_ctx *ctx = nf->ctx;
++	int status = 0;
++	bool armed = false;
++
++	for (;;) {
++		if (!nvkvm_transport_ready(&nvkvm)) {
++			/* Device removal aborts the virtual operation, never succeeds. */
++			status = -ENODEV;
++			break;
++		}
++		if (!armed) {
++			atomic_set(&ctx->poll_armed, 1);
++			armed = nvkvm_virtio_poll_arm(ctx->session->isolate_id,
++				ctx->handle_id, 1) == 0;
++			if (!armed)
++				atomic_set(&ctx->poll_armed, 0);
++		}
++		/* Only the native sync_file's terminal status proves completion.
++		 * An IRQ is a wakeup, not permission to reuse an unfinished buffer.
++		 * The timed query also tolerates a missed event or a full poll set. */
++		int ret = nvkvm_virtio_sync_file_status(ctx, &status);
++		if (!ret && (status == 1 || (status < 0 && status >= -MAX_ERRNO)))
++			break;
++		wait_event_timeout(ctx->poll_wq,
++			atomic_xchg(&ctx->poll_events, 0), msecs_to_jiffies(10));
++	}
++	if (status < 0)
++		dma_fence_set_error(&nf->base, status);
++	dma_fence_signal(&nf->base);
++	dma_fence_put(&nf->base); /* monitoring reference */
++}
++
++struct dma_fence *nvkvm_sync_fence_export(struct nvkvm_fd_ctx *owner,
++    __u32 fence_context, __u32 timeout_ms, __u64 wait_value)
++{
++	__u32 handle = 0;
++	int ret;
++	if (!nvkvm.sync_file_bridge)
++		return ERR_PTR(-EOPNOTSUPP);
++	ret = nvkvm_virtio_export_sync_file(owner, fence_context, timeout_ms, wait_value, &handle);
++	if (ret)
++		return ERR_PTR(ret);
++	if (!handle)
++		return ERR_PTR(-EPROTO);
++	struct nvkvm_fd_ctx *ctx = nvkvm_fd_ctx_adopt_sync_file(owner, handle);
++	if (IS_ERR(ctx)) {
++		nvkvm_virtio_close_handle_on_isolate(handle, owner->session->isolate_id);
++		nvkvm_virtio_close_handle(handle);
++		return ERR_CAST(ctx);
++	}
++	struct nvkvm_sync_fence *nf = kzalloc(sizeof(*nf), GFP_KERNEL);
++	if (!nf) {
++		nvkvm_fd_ctx_close(ctx);
++		return ERR_PTR(-ENOMEM);
++	}
++	if (!try_module_get(THIS_MODULE)) {
++		nvkvm_fd_ctx_close(ctx);
++		kfree(nf);
++		return ERR_PTR(-ENODEV);
++	}
++	nf->ctx = ctx;
++	spin_lock_init(&nf->lock);
++	INIT_WORK(&nf->poll_work, sync_poll);
++	INIT_WORK(&nf->cleanup, sync_cleanup);
++	/* Independent native fences must not share an ordered timeline context. */
++	dma_fence_init(&nf->base, &sync_ops, &nf->lock, dma_fence_context_alloc(1), 1);
++	dma_fence_get(&nf->base);
++	queue_work(sync_wq, &nf->poll_work);
++	return &nf->base;
++}
++
++int nvkvm_sync_file_export(struct nvkvm_fd_ctx *owner,
++    __u32 fence_context, __u32 timeout_ms, __u64 wait_value)
++{
++	struct dma_fence *fence = nvkvm_sync_fence_export(owner, fence_context, timeout_ms, wait_value);
++	if (IS_ERR(fence))
++		return PTR_ERR(fence);
++	struct sync_file *file = sync_file_create(fence);
++	dma_fence_put(fence);
++	if (!file)
++		return -ENOMEM;
++	int fd = get_unused_fd_flags(O_CLOEXEC);
++	if (fd < 0) {
++		fput(file->file);
++		return fd;
++	}
++	fd_install(fd, file->file);
++	return fd;
++}
++
++int nvkvm_sync_file_init(void)
++{
++	sync_wq = alloc_workqueue("nvkvm-sync", WQ_UNBOUND | WQ_MEM_RECLAIM, 0);
++	return sync_wq ? 0 : -ENOMEM;
++}
++
++void nvkvm_sync_file_fini(void)
++{
++	destroy_workqueue(sync_wq);
++	sync_wq = NULL;
++}
+--- a/src/guest/nvkvm_virtio.c
++++ b/src/guest/nvkvm_virtio.c
+@@ -381,6 +381,18 @@
+ 		 * Both responses are {status, reserved}, same as the sibling
+ 		 * *_ON_ISOLATE control-plane replies above.
+ 		 */
++		case NVKVM_REQ_EXPORT_SYNC_FILE: {
++			struct nvkvm_resp_export_sync_file *resp = (void *)(hdr + 1);
++			inf->status = le32_to_cpu(resp->status);
++			inf->retval = le32_to_cpu(resp->handle_id);
++			break;
++		}
++		case NVKVM_REQ_SYNC_FILE_STATUS: {
++			struct nvkvm_resp_sync_file_status *resp = (void *)(hdr + 1);
++			inf->status = le32_to_cpu(resp->status);
++			inf->retval = le32_to_cpu(resp->fence_status);
++			break;
++		}
+ 		case NVKVM_REQ_POLL_ON_ISOLATE: {
+ 			struct nvkvm_resp_poll_on_isolate *resp = (void *)(hdr + 1);
+ 			inf->status = le32_to_cpu(resp->status);
+@@ -994,6 +1006,13 @@
+ 		offsetof(struct nvkvm_virtio_config, flags)) &
+ 		NVKVM_CONFIG_F_GRAPHICS) != 0;
+ 
++	state->sync_file_bridge = state->graphics_enabled &&
++		(virtio_cread64(vdev, offsetof(struct nvkvm_virtio_config, flags)) &
++		 NVKVM_CONFIG_F_SYNC_FILE) != 0;
++
++	if (state->sync_file_bridge)
++		pr_info("nvkvm: experimental host sync_file bridge negotiated\n");
++
+ 	virtio_device_ready(vdev);
+ 
+ 	/* #101: pre-post the IN buffers QEMU fills with async OS-event
+@@ -1118,6 +1137,40 @@
+  * host fd and pushes a VQ_EVT (→ nvkvm_evt_deliver) when it fires, so a
+  * blocking-sync waiter wakes promptly instead of eating the ~18ms poll-timeout
+  * fallback. Control-plane (isolate_id stays 0 in the inflight → fast response). */
++int nvkvm_virtio_export_sync_file(struct nvkvm_fd_ctx *owner,
++    __u32 fence_context, __u32 timeout_ms, __u64 wait_value, __u32 *handle)
++{
++	struct {
++		struct nvkvm_hdr hdr;
++		struct nvkvm_req_export_sync_file req;
++	} msg = {0};
++	__u64 value = 0;
++	msg.req.isolate_id = cpu_to_le32(owner->session->isolate_id);
++	msg.req.handle_id = cpu_to_le32(owner->handle_id);
++	msg.req.fence_context_handle = cpu_to_le32(fence_context);
++	msg.req.timeout_ms = cpu_to_le32(timeout_ms);
++	msg.req.wait_value = cpu_to_le64(wait_value);
++	int ret = simple_req(NVKVM_REQ_EXPORT_SYNC_FILE, &msg, sizeof(msg), &value);
++	if (!ret)
++		*handle = (__u32)value;
++	return ret;
++}
++
++int nvkvm_virtio_sync_file_status(struct nvkvm_fd_ctx *ctx, int *status)
++{
++	struct {
++		struct nvkvm_hdr hdr;
++		struct nvkvm_req_sync_file_status req;
++	} msg = {0};
++	__u64 value = 0;
++	msg.req.isolate_id = cpu_to_le32(ctx->session->isolate_id);
++	msg.req.handle_id = cpu_to_le32(ctx->handle_id);
++	int ret = simple_req(NVKVM_REQ_SYNC_FILE_STATUS, &msg, sizeof(msg), &value);
++	if (!ret)
++		*status = (__s32)(__u32)value;
++	return ret;
++}
++
+ int nvkvm_virtio_poll_arm(__u32 isolate_id, __u32 handle_id, int arm)
+ {
+ 	struct {
+--- a/src/qemu/nvkvm_handle.c
++++ b/src/qemu/nvkvm_handle.c
+@@ -13,6 +13,8 @@
+ #include <linux/memfd.h>
+ #include <sys/syscall.h>
+ #include <sys/eventfd.h>
++#include <sys/ioctl.h>
++#include <linux/sync_file.h>
+ #include <errno.h>
+ #include <string.h>
+ #include <stdio.h>
+@@ -190,6 +192,77 @@
+ 	*handle_id_out = id;
+ 	pthread_mutex_unlock(&t->lock);
+ 	return 0;
++}
++
++/* Sync-file handles can only originate in a graphics fence export. */
++int nvkvm_handle_alloc_sync_file(struct nvkvm_handle_table *t,
++                                uint32_t session_id, uint32_t *handle_id_out)
++{
++	pthread_mutex_lock(&t->lock);
++	uint32_t id;
++	struct nvkvm_handle *h = alloc_slot(t, &id);
++	if (!h) {
++		pthread_mutex_unlock(&t->lock);
++		return -EMFILE;
++	}
++	h->type = NVKVM_HANDLE_TYPE_SYNC_FILE;
++	h->fd = -1;
++	h->session_id = session_id;
++	h->dev_id = NVKVM_DEV_SYNC_FILE;
++	*handle_id_out = id;
++	pthread_mutex_unlock(&t->lock);
++	return 0;
++}
++
++int nvkvm_handle_attach_sync_file(struct nvkvm_handle_table *t,
++                                uint32_t handle_id, int fd)
++{
++	if (!handle_id || handle_id >= NVKVM_HANDLE_MAX || fd < 0)
++		return -EINVAL;
++	pthread_mutex_lock(&t->lock);
++	struct nvkvm_handle *h = &t->handles[handle_id];
++	bool valid = h->in_use && h->id == handle_id && h->fd < 0 &&
++		     h->type == NVKVM_HANDLE_TYPE_SYNC_FILE;
++	uint64_t generation = h->generation;
++	pthread_mutex_unlock(&t->lock);
++	if (!valid)
++		return -EBADF;
++	/* A device, eventfd, memfd, or DRM syncobj descriptor is not a sync_file.
++	 * Query metadata only (num_fences=0), without accepting arbitrary ioctls. */
++	struct sync_file_info info = {0};
++	int ret;
++	do {
++		ret = ioctl(fd, SYNC_IOC_FILE_INFO, &info);
++	} while (ret < 0 && errno == EINTR);
++	if (ret < 0)
++		return -EBADF;
++	pthread_mutex_lock(&t->lock);
++	valid = h->in_use && h->id == handle_id && h->generation == generation &&
++		h->type == NVKVM_HANDLE_TYPE_SYNC_FILE && h->fd < 0;
++	if (valid)
++		h->fd = fd;
++	pthread_mutex_unlock(&t->lock);
++	return valid ? 0 : -EBADF;
++}
++
++int nvkvm_handle_acquire_sync_file(struct nvkvm_handle_table *t,
++                                  uint32_t handle_id, uint32_t *session_id)
++{
++	if (!handle_id || handle_id >= NVKVM_HANDLE_MAX)
++		return -EBADF;
++	pthread_mutex_lock(&t->lock);
++	struct nvkvm_handle *h = &t->handles[handle_id];
++	int fd = -EBADF;
++	if (h->in_use && h->id == handle_id && h->fd >= 0 &&
++	    h->type == NVKVM_HANDLE_TYPE_SYNC_FILE) {
++		fd = fcntl(h->fd, F_DUPFD_CLOEXEC, 0);
++		if (fd < 0)
++			fd = -errno;
++		else if (session_id)
++			*session_id = h->session_id;
++	}
++	pthread_mutex_unlock(&t->lock);
++	return fd;
+ }
+ 
+ /*
+--- a/src/qemu/nvkvm_handle.h
++++ b/src/qemu/nvkvm_handle.h
+@@ -15,6 +15,7 @@
+ #include "nvkvm_log.h"
+ 
+ #define NVKVM_HANDLE_TYPE_NVIDIA  1   /* open /dev/nvidia* fd     */
++#define NVKVM_HANDLE_TYPE_SYNC_FILE 3 /* verified sync_file, poll/status/close only */
+ #define NVKVM_HANDLE_TYPE_MEMORY  2   /* memfd                    */
+ 
+ #define NVKVM_HANDLE_MAX  65536
+@@ -72,6 +73,12 @@
+ int  nvkvm_handle_alloc_pending(struct nvkvm_handle_table *t,
+ 				 uint32_t session_id, int dev_id,
+ 				 uint32_t *handle_id_out);
++int nvkvm_handle_alloc_sync_file(struct nvkvm_handle_table *t,
++                                  uint32_t session_id, uint32_t *handle_id_out);
++int nvkvm_handle_attach_sync_file(struct nvkvm_handle_table *t,
++                                uint32_t handle_id, int fd);
++int nvkvm_handle_acquire_sync_file(struct nvkvm_handle_table *t,
++                                  uint32_t handle_id, uint32_t *session_id);
+ int  nvkvm_handle_attach_fd(struct nvkvm_handle_table *t,
+ 			    uint32_t handle_id, int fd);
+ void nvkvm_handle_abort_open(struct nvkvm_handle_table *t,
+--- a/src/qemu/nvkvm_isolate.c
++++ b/src/qemu/nvkvm_isolate.c
+@@ -3216,6 +3216,53 @@
+ 	return err;
+ }
+ 
++static int nvkvm_isolate_command_fd(struct nvkvm_isolate *iso,
++    const void *cmd_buf, size_t cmd_size, int *fd_out)
++{
++	/* Inline sync_send_recv pattern; we also need the received fd, which
++	 * the reader stashes in iso->sync_open_fd before signaling. */
++	pthread_mutex_lock(&iso->sync_cmd_lock);   /* F3-1, see sync_send_recv */
++	pthread_mutex_lock(&iso->sync_lock);
++	iso->sync_done    = false;
++	iso->sync_error   = 0;
++	if (iso->sync_open_fd >= 0)
++		close(iso->sync_open_fd);
++	iso->sync_open_fd = -1;
++
++	pthread_mutex_lock(&iso->write_lock);
++	ssize_t sr = sock_send_full(iso->sock_fd, cmd_buf, cmd_size);
++	pthread_mutex_unlock(&iso->write_lock);
++	if (sr < 0) {
++		pthread_mutex_unlock(&iso->sync_lock);
++		pthread_mutex_unlock(&iso->sync_cmd_lock);
++		return (int)sr;
++	}
++
++	int wrc = nvkvm_iso_slot_wait_or_die(iso, &iso->sync_lock,
++					     &iso->sync_cond, &iso->sync_done,
++					     NVKVM_ISO_SYNC_TIMEOUT_MS,
++					     "fd-producing command never answered");
++	int err = wrc ? wrc : iso->sync_error;
++	int fd  = iso->sync_open_fd;
++	iso->sync_open_fd = -1;
++	pthread_mutex_unlock(&iso->sync_lock);
++	pthread_mutex_unlock(&iso->sync_cmd_lock);
++
++	if (err) {
++		if (fd >= 0)
++			close(fd);
++		return err;
++	}
++	if (fd < 0)
++		return -EPROTO;   /* stub said success but sent no fd */
++
++	if (fd_out)
++		*fd_out = fd;
++	else
++		close(fd);
++	return 0;
++}
++
+ int nvkvm_isolate_open_device(struct nvkvm_isolate_table *t,
+ 			      uint32_t isolate_id, uint32_t handle_id,
+ 			      uint32_t dev_id, uint32_t flags,
+@@ -3244,46 +3291,33 @@
+ 		.txn_id    = txn_id,
+ 	};
+ 
+-	/* Inline sync_send_recv pattern; we also need the received fd, which
+-	 * the reader stashes in iso->sync_open_fd before signaling. */
+-	pthread_mutex_lock(&iso->sync_cmd_lock);   /* F3-1, see sync_send_recv */
+-	pthread_mutex_lock(&iso->sync_lock);
+-	iso->sync_done    = false;
+-	iso->sync_error   = 0;
+-	iso->sync_open_fd = -1;
+-
+-	pthread_mutex_lock(&iso->write_lock);
+-	ssize_t sr = sock_send_full(iso->sock_fd, &cmd, sizeof(cmd));
+-	pthread_mutex_unlock(&iso->write_lock);
+-	if (sr < 0) {
+-		pthread_mutex_unlock(&iso->sync_lock);
+-		pthread_mutex_unlock(&iso->sync_cmd_lock);
+-		return (int)sr;
+-	}
+-
+-	int wrc = nvkvm_iso_slot_wait_or_die(iso, &iso->sync_lock,
+-					     &iso->sync_cond, &iso->sync_done,
+-					     NVKVM_ISO_SYNC_TIMEOUT_MS,
+-					     "OPEN_DEVICE never answered");
+-	int err = wrc ? wrc : iso->sync_error;
+-	int fd  = wrc ? -1  : iso->sync_open_fd;
+-	iso->sync_open_fd = -1;
+-	pthread_mutex_unlock(&iso->sync_lock);
+-	pthread_mutex_unlock(&iso->sync_cmd_lock);
+-
+-	if (err) {
+-		if (fd >= 0)
+-			close(fd);
+-		return err;
+-	}
+-	if (fd < 0)
+-		return -EPROTO;   /* stub said success but sent no fd */
+-
++	return nvkvm_isolate_command_fd(iso, &cmd, sizeof(cmd), fd_out);
++}
++
++int nvkvm_isolate_export_sync_file(struct nvkvm_isolate_table *t,
++    uint32_t isolate_id, uint32_t render_handle, uint32_t output_handle,
++    uint32_t fence_context_handle, uint32_t timeout_ms, uint64_t wait_value,
++    int *fd_out)
++{
+ 	if (fd_out)
+-		*fd_out = fd;
+-	else
+-		close(fd);
+-	return 0;
++		*fd_out = -1;
++	if (!isolate_id || isolate_id >= NVKVM_ISOLATE_MAX)
++		return -ENOENT;
++	struct nvkvm_isolate *iso = &t->isolates[isolate_id];
++	pthread_mutex_lock(&iso->lock);
++	bool valid = iso->in_use && iso->id == isolate_id && iso->alive;
++	pthread_mutex_unlock(&iso->lock);
++	if (!valid)
++		return -ENOENT;
++	struct isolate_cmd_export_sync_file cmd = {
++		.type = ISOLATE_CMD_EXPORT_SYNC_FILE,
++		.render_handle = render_handle,
++		.output_handle = output_handle,
++		.fence_context_handle = fence_context_handle,
++		.timeout_ms = timeout_ms,
++		.wait_value = wait_value,
++	};
++	return nvkvm_isolate_command_fd(iso, &cmd, sizeof(cmd), fd_out);
+ }
+ 
+ int nvkvm_isolate_present_export(struct nvkvm_isolate_table *t,
+--- a/src/qemu/nvkvm_isolate.h
++++ b/src/qemu/nvkvm_isolate.h
+@@ -596,6 +596,10 @@
+ /*
+  * Register/deregister poll on a handle in the isolate.
+  */
++int nvkvm_isolate_export_sync_file(struct nvkvm_isolate_table *t,
++    uint32_t isolate_id, uint32_t render_handle, uint32_t output_handle,
++    uint32_t fence_context_handle, uint32_t timeout_ms, uint64_t wait_value,
++    int *fd_out);
+ int nvkvm_isolate_poll(struct nvkvm_isolate_table *t,
+ 		       uint32_t isolate_id, uint32_t handle_id,
+ 		       uint32_t events);
+--- a/src/qemu/nvkvm_isolate_handlers.c
++++ b/src/qemu/nvkvm_isolate_handlers.c
+@@ -18,6 +18,7 @@
+ #include <stdio.h>
+ #include <sys/mman.h>
+ #include <sys/ioctl.h>
++#include <linux/sync_file.h>
+ 
+ #include "virtio_nvgpu.h"
+ #include "nvkvm_ctrl_allowlist.h"
+@@ -5283,6 +5284,85 @@
+ 	return session_has_isolate(nv, h->session_id, isolate_id);
+ }
+ 
++int nvkvm_req_export_sync_file(VirtIONvgpu *nv,
++    struct nvkvm_req_export_sync_file *req,
++    struct nvkvm_resp_export_sync_file *resp)
++{
++	resp->handle_id = 0;
++	resp->status = EPERM;
++	if (!nv->graphics || !nv->sync_file_bridge ||
++	    !poll_pair_ok(nv, req->handle_id, req->isolate_id))
++		return 0;
++	struct nvkvm_handle *render = nvkvm_handle_get(&nv->handles, req->handle_id);
++	if (!render || render->type != NVKVM_HANDLE_TYPE_NVIDIA ||
++	    render->dev_id < 32 || render->dev_id >= 48)
++		return 0;
++	uint32_t output = 0;
++	int fd = -1;
++	int ret = nvkvm_handle_alloc_sync_file(&nv->handles, render->session_id, &output);
++	if (ret < 0) {
++		resp->status = (uint32_t)-ret;
++		return 0;
++	}
++	/* Reserve the isolate reference before export. It is released on every
++	 * failure, or by the guest's ordinary close-on-isolate/close sequence. */
++	nvkvm_handle_ref_isolate(&nv->handles, output);
++	ret = nvkvm_isolate_export_sync_file(&nv->isolates, req->isolate_id,
++		req->handle_id, output, req->fence_context_handle,
++		req->timeout_ms, req->wait_value, &fd);
++	bool exported = ret == 0;
++	if (!ret)
++		ret = nvkvm_handle_attach_sync_file(&nv->handles, output, fd);
++	if (ret < 0) {
++		if (fd >= 0)
++			close(fd);
++		if (exported)
++			nvkvm_isolate_close_handle(&nv->isolates, &nv->handles,
++				req->isolate_id, output);
++		/* unref is saturating; also covers a dead stub during rollback. */
++		nvkvm_handle_unref_isolate(&nv->handles, output);
++		nvkvm_handle_abort_open(&nv->handles, output);
++		resp->status = (uint32_t)-ret;
++		return 0;
++	}
++	resp->handle_id = output;
++	resp->status = 0;
++	return 0;
++}
++
++int nvkvm_req_sync_file_status(VirtIONvgpu *nv,
++    struct nvkvm_req_sync_file_status *req,
++    struct nvkvm_resp_sync_file_status *resp)
++{
++	resp->status = EPERM;
++	resp->fence_status = 0;
++	if (!nv->graphics || !nv->sync_file_bridge)
++		return 0;
++	uint32_t session = 0;
++	int fd = nvkvm_handle_acquire_sync_file(&nv->handles, req->handle_id, &session);
++	if (fd < 0) {
++		resp->status = (uint32_t)-fd;
++		return 0;
++	}
++	if (session_has_isolate(nv, session, req->isolate_id)) {
++		struct sync_file_info info = {0};
++		int ret;
++		do {
++			ret = ioctl(fd, SYNC_IOC_FILE_INFO, &info);
++		} while (ret < 0 && errno == EINTR);
++		if (ret < 0)
++			resp->status = (uint32_t)errno;
++		else if (info.status > 1 || info.status < -4095)
++			resp->status = EPROTO;
++		else {
++			resp->fence_status = (uint32_t)info.status;
++			resp->status = 0;
++		}
++	}
++	close(fd);
++	return 0;
++}
++
+ int nvkvm_req_poll_on_isolate(VirtIONvgpu *nv,
+ 			       struct nvkvm_req_poll_on_isolate *req,
+ 			       struct nvkvm_resp_poll_on_isolate *resp)
+--- a/src/qemu/virtio_nvgpu.c
++++ b/src/qemu/virtio_nvgpu.c
+@@ -1103,6 +1103,14 @@
+ 			    nvkvm_req_close_handle_on_isolate,
+ 			    nvkvm_resp_close_handle_on_isolate,
+ 			    nvkvm_req_close_handle_on_isolate)
++		ISOLATE_REQ(NVKVM_REQ_EXPORT_SYNC_FILE,
++			    nvkvm_req_export_sync_file,
++			    nvkvm_resp_export_sync_file,
++			    nvkvm_req_export_sync_file)
++		ISOLATE_REQ(NVKVM_REQ_SYNC_FILE_STATUS,
++			    nvkvm_req_sync_file_status,
++			    nvkvm_resp_sync_file_status,
++			    nvkvm_req_sync_file_status)
+ 		ISOLATE_REQ(NVKVM_REQ_POLL_ON_ISOLATE,
+ 			    nvkvm_req_poll_on_isolate,
+ 			    nvkvm_resp_poll_on_isolate,
+@@ -1645,7 +1653,8 @@
+ 
+ 	/* Advertise the graphics capability to the guest (QEMU dictates). */
+ 	nv->config_space.flags = cpu_to_le64(
+-		nv->graphics ? NVKVM_CONFIG_F_GRAPHICS : 0);
++		(nv->graphics ? NVKVM_CONFIG_F_GRAPHICS : 0) |
++		(nv->graphics && nv->sync_file_bridge ? NVKVM_CONFIG_F_SYNC_FILE : 0));
+ 	if (!nv->graphics)
+ 		info_report("nvkvm: graphics disabled (compute-only): DRM render "
+ 			    "node + NVKMS modeset device + ioctls refused");
+@@ -1857,6 +1866,7 @@
+ 	/* graphics=on|off (default on): expose+forward the DRM render node and
+ 	 * NVKMS modeset device. off → compute-only VM, smaller attack surface. */
+ 	DEFINE_PROP_BOOL("graphics", VirtIONvgpu, graphics, true),
++	DEFINE_PROP_BOOL("sync-file-bridge", VirtIONvgpu, sync_file_bridge, false),
+ };
+ 
+ static void virtio_nvgpu_class_init(ObjectClass *klass, const void *data)
+--- a/src/qemu/virtio_nvgpu.h
++++ b/src/qemu/virtio_nvgpu.h
+@@ -297,6 +297,7 @@
+ 	 * NVKMS device + ioctl attack surface. QEMU enforces it (rejects those
+ 	 * device opens + ioctls) regardless of the untrusted guest. */
+ 	bool                graphics;
++	bool                sync_file_bridge;
+ 
+ 	/*
+ 	 * The isolation mode actually in force, resolved at realize (mode `auto`
+@@ -513,6 +514,12 @@
+ int nvkvm_req_munmap_on_isolate(VirtIONvgpu *nv,
+ 				 struct nvkvm_req_munmap_on_isolate *req,
+ 				 struct nvkvm_resp_munmap_on_isolate *resp);
++int nvkvm_req_export_sync_file(VirtIONvgpu *nv,
++    struct nvkvm_req_export_sync_file *req,
++    struct nvkvm_resp_export_sync_file *resp);
++int nvkvm_req_sync_file_status(VirtIONvgpu *nv,
++    struct nvkvm_req_sync_file_status *req,
++    struct nvkvm_resp_sync_file_status *resp);
+ int nvkvm_req_poll_on_isolate(VirtIONvgpu *nv,
+ 			       struct nvkvm_req_poll_on_isolate *req,
+ 			       struct nvkvm_resp_poll_on_isolate *resp);
+--- a/src/stub/nvkvm_stub.c
++++ b/src/stub/nvkvm_stub.c
+@@ -2163,6 +2163,39 @@
+ 	return r < 0 ? -1 : 0;
+ }
+ 
++static void handle_export_sync_file(const struct isolate_cmd_export_sync_file *cmd)
++{
++	uint32_t dev = handle_dev_lookup(cmd->render_handle);
++	int render = handle_lookup(cmd->render_handle);
++	if (render < 0 || dev < 32 || dev >= 48 || !cmd->output_handle ||
++	    cmd->output_handle >= MAX_HANDLES || cmd->output_handle == cmd->render_handle) {
++		send_open_device_resp(0, -EBADF, -1);
++		return;
++	}
++	struct {
++		uint32_t context;
++		uint32_t timeout_ms;
++		uint64_t wait_value;
++		int32_t fd;
++		uint32_t reserved;
++	} params = {
++		.context = cmd->fence_context_handle,
++		.timeout_ms = cmd->timeout_ms,
++		.wait_value = cmd->wait_value,
++		.fd = -1,
++	};
++	long ret = stub_ioctl(render, NVKVM_SYNC_FILE_FENCE_CREATE, &params);
++	if (ret < 0 || params.fd < 0) {
++		send_open_device_resp(0, ret < 0 ? (int)ret : -EIO, -1);
++		return;
++	}
++	/* Retire an orphan from a failed prior attach before reusing its ID. */
++	handle_remove(cmd->output_handle);
++	handle_store(cmd->output_handle, params.fd, NVKVM_DEV_SYNC_FILE);
++	if (send_open_device_resp(0, 0, params.fd) < 0)
++		handle_remove(cmd->output_handle);
++}
++
+ static unsigned stub_drm_fd_count;
+ 
+ static void handle_open_device(struct isolate_cmd_open_device *cmd)
+@@ -2811,6 +2844,7 @@
+ 	struct isolate_cmd_ioctl            ioctl_cmd;
+ 	struct isolate_cmd_mmap             mmap_cmd;
+ 	struct isolate_cmd_munmap           munmap_cmd;
++	struct isolate_cmd_export_sync_file export_sync_file;
+ 	struct isolate_cmd_poll             poll_cmd;
+ 	struct isolate_cmd_unpoll           unpoll_cmd;
+ 	struct isolate_cmd_open_device      open_dev;
+@@ -3264,6 +3298,12 @@
+ 		locked_send(&r, sizeof(r));
+ 		return 0;
+ 	}
++	case ISOLATE_CMD_EXPORT_SYNC_FILE:
++		if (n != (long)sizeof(c->export_sync_file))
++			send_open_device_resp(0, -EINVAL, -1);
++		else
++			handle_export_sync_file(&c->export_sync_file);
++		return 0;
+ 	case ISOLATE_CMD_POLL:
+ 		/* #127: arm the host os-event fd; the reader loop ppoll()s it and
+ 		 * sends ISOLATE_RESP_POLL_EVENT when it fires. */
+--- a/tests/unit/mock_stub.c
++++ b/tests/unit/mock_stub.c
+@@ -71,6 +71,11 @@
+ 		case ISOLATE_CMD_CLOSE_FD:
+ 		case ISOLATE_CMD_MUNMAP:
+ 		case ISOLATE_CMD_UNPOLL:
++			send_ok(sock);
++			break;
++
++		case ISOLATE_CMD_EXPORT_SYNC_FILE:
++			/* Deliberately omit the required descriptor. */
+ 			send_ok(sock);
+ 			break;
+ 
+--- a/tests/unit/run_tests.sh
++++ b/tests/unit/run_tests.sh
+@@ -50,7 +50,7 @@
+ # The number is the exact case count that must run AND pass.
+ declare -A TALLY_SUITES=(
+     [test_objects]=20
+-    [test_handle]=12
++    [test_handle]=13
+     [test_tables]=17
+     [test_nvkms_allowlist]=769
+     [test_stub_ptr_sanitize]=17
+@@ -111,7 +111,7 @@
+ # So the "isolate reports itself not-alive, and its stub sees EOF right after
+ # exec" symptom had a mundane cause: QEMU had closed its own end of the socket,
+ # by hand, one instruction before it needed it.
+-ISOLATE_TOTAL=10
++ISOLATE_TOTAL=11
+ ISOLATE_KNOWN_FAIL=""
+ 
+ # Cases that legitimately differ BY ENVIRONMENT, and so cannot be pinned either
+--- a/tests/unit/test_handle.c
++++ b/tests/unit/test_handle.c
+@@ -371,3 +371,29 @@
+ 
+ 	nvkvm_handle_table_fini(&t);
+ }
++
++TEST(test_sync_file_handles_reject_unrelated_descriptors)
++{
++	struct nvkvm_handle_table t;
++	nvkvm_handle_table_init(&t);
++	uint32_t pending = 0, memory = 0, session = 0;
++	ASSERT_EQ(nvkvm_handle_alloc_sync_file(&t, 7, &pending), 0);
++	struct nvkvm_handle *h = nvkvm_handle_get(&t, pending);
++	ASSERT_NOTNULL(h);
++	ASSERT_EQ(h->type, NVKVM_HANDLE_TYPE_SYNC_FILE);
++	ASSERT_EQ(h->fd, -1);
++	ASSERT_EQ(open_test_memory_handle(&t, 7, &memory), 0);
++	struct nvkvm_handle *mem = nvkvm_handle_get(&t, memory);
++	ASSERT_NOTNULL(mem);
++	ASSERT_EQ(nvkvm_handle_attach_sync_file(&t, pending, mem->fd), -EBADF);
++	ASSERT_EQ(nvkvm_handle_acquire_sync_file(&t, memory, &session), -EBADF);
++	ASSERT_EQ(nvkvm_handle_acquire_sync_file(&t, pending, &session), -EBADF);
++	int pipefd[2];
++	ASSERT_EQ(pipe(pipefd), 0);
++	ASSERT_EQ(nvkvm_handle_attach_sync_file(&t, pending, pipefd[0]), -EBADF);
++	close(pipefd[0]);
++	close(pipefd[1]);
++	nvkvm_handle_abort_open(&t, pending);
++	ASSERT_NULL(nvkvm_handle_get(&t, pending));
++	nvkvm_handle_table_fini(&t);
++}
+--- a/tests/unit/test_isolate.c
++++ b/tests/unit/test_isolate.c
+@@ -339,6 +339,20 @@
+ }
+ 
+ /* ── Test 7: poll / unpoll ───────────────────────────────────────────────── */
++
++TEST(sync_file_export_requires_descriptor)
++{
++	fixture_init();
++	uint32_t iso_id = 0;
++	EXPECT_EQ(nvkvm_isolate_create(&g_it, 21, NULL, &iso_id), 0);
++	int fd = -1;
++	EXPECT_EQ(nvkvm_isolate_export_sync_file(&g_it, iso_id, 1, 2, 3,
++			5000, 1, &fd), -EPROTO);
++	EXPECT_EQ(fd, -1);
++	EXPECT_EQ(nvkvm_isolate_unpoll(&g_it, iso_id, 1), 0);
++	EXPECT_EQ(nvkvm_isolate_kill(&g_it, iso_id), 0);
++	fixture_fini();
++}
+ 
+ TEST(poll_enqueue)
+ {
+@@ -534,6 +548,7 @@
+ 	RUN(sync_mmap_munmap);
+ 	RUN(poll_unpoll);
+ 	RUN(poll_enqueue);
++	RUN(sync_file_export_requires_descriptor);
+ 	RUN(foreign_relay_cleanup_on_kill);
+ 	RUN(nvkms_vblank_quota_lifecycle);
+ 

@@ -5,6 +5,48 @@ use std::{
 };
 
 #[test]
+fn acquire_eventfd_wakes_without_wayland_or_drm_activity_and_is_not_consumed() {
+    let (read, _write) = UnixStream::pair().expect("idle display socket");
+    let acquire = rustix::event::eventfd(
+        0,
+        rustix::event::EventfdFlags::CLOEXEC | rustix::event::EventfdFlags::NONBLOCK,
+    )
+    .expect("owned acquire eventfd");
+    rustix::io::write(&acquire, &1_u64.to_ne_bytes()).expect("signal acquire");
+    let mut waiter = ForwardWait::new(&json!({"forward_wait":"events"})).expect("KMS event mode");
+    let wakes = waiter
+        .wait_with_acquires([read.as_fd()], std::iter::once(acquire.as_fd()))
+        .expect("wait on all live sources");
+    assert_eq!(wakes, 1);
+    let report = waiter.report().expect("report");
+    assert_eq!(report["wait_calls"], 1);
+    assert_eq!(report["timeouts"], 0);
+    let mut counter = [0_u8; 8];
+    rustix::io::read(&acquire, &mut counter).expect("fence owner can still observe readiness");
+    assert_eq!(u64::from_ne_bytes(counter), 1);
+}
+
+#[test]
+fn acquire_wait_retains_idle_timeout_and_rejects_disconnected_extra_fd() {
+    let (read, _write) = UnixStream::pair().expect("idle display socket");
+    let (extra, peer) = UnixStream::pair().expect("owned extra event source");
+    let mut waiter = ForwardWait::new(&json!({"forward_wait":"events"})).expect("KMS event mode");
+    assert_eq!(
+        waiter
+            .wait_with_acquires([read.as_fd()], std::iter::once(extra.as_fd()))
+            .expect("bounded idle timeout"),
+        0
+    );
+    assert_eq!(waiter.report().expect("report")["timeouts"], 1);
+    drop(peer);
+    assert!(
+        waiter
+            .wait_with_acquires([read.as_fd()], std::iter::once(extra.as_fd()))
+            .is_err()
+    );
+}
+
+#[test]
 fn unreadable_socket_times_out_but_readable_socket_wakes_the_wait() {
     let (read, mut write) = UnixStream::pair().expect("owned sockets");
     let mut waiter = ForwardWait::new(&json!({"forward_wait":"events"})).expect("event mode");

@@ -1,0 +1,60 @@
+--- a/src/guest/nvkvm_kms.c
++++ b/src/guest/nvkvm_kms.c
+@@ -17,6 +17,7 @@
+  * primary plane, atomic helpers. No multi-head / HDCP / overlays.
+  */
+ #include <drm/drm_atomic_helper.h>
++#include <drm/drm_plane_helper.h>
+ #include <drm/drm_gem_framebuffer_helper.h>
+ #include <drm/drm_probe_helper.h>
+ #include <drm/drm_simple_kms_helper.h>
+@@ -1366,6 +1367,38 @@
+ 
+ /* A copy of whatever funcs drm_simple_display_pipe installed, plus the modifier
+  * callback (filled in at init so we stay version-agnostic). One virtual head. */
++/* The host viewer already samples the entire exported framebuffer into its
++ * window. Permit that full-image scaling explicitly; never advertise crop,
++ * panning, partial planes or rotation that our present protocol cannot carry.
++ * Keep the simple pipe's prepare/update/cleanup hooks and strict read ownership.
++ */
++static int nvkvm_plane_check(struct drm_plane *plane,
++                            struct drm_atomic_state *state)
++{
++        struct drm_plane_state *ps = drm_atomic_get_new_plane_state(state, plane);
++        struct drm_simple_display_pipe *pipe =
++                container_of(plane, struct drm_simple_display_pipe, plane);
++        struct drm_crtc_state *cs =
++                drm_atomic_get_new_crtc_state(state, &pipe->crtc);
++        int ret;
++
++        ret = drm_atomic_helper_check_plane_state(ps, cs, 1 << 12, 16 << 16,
++                                                 false, false);
++        if (ret || !ps->visible)
++                return ret;
++        if (ps->src_x || ps->src_y ||
++            ps->src_w != (u64)ps->fb->width << 16 ||
++            ps->src_h != (u64)ps->fb->height << 16 ||
++            ps->crtc_x || ps->crtc_y ||
++            ps->crtc_w != cs->mode.hdisplay ||
++            ps->crtc_h != cs->mode.vdisplay)
++                return -EINVAL;
++        if (pipe->funcs && pipe->funcs->check)
++                return pipe->funcs->check(pipe, ps, cs);
++        return 0;
++}
++
++static struct drm_plane_helper_funcs nvkvm_plane_helpers;
+ static struct drm_plane_funcs nvkvm_plane_funcs;
+ 
+ /* ── Mode config ─────────────────────────────────────────────────────────── */
+@@ -1457,6 +1490,10 @@
+ 		nvkvm_plane_funcs = *pl->funcs;
+ 		nvkvm_plane_funcs.format_mod_supported = nvkvm_plane_format_mod_supported;
+ 		pl->funcs = &nvkvm_plane_funcs;
++                nvkvm_plane_helpers = *pl->helper_private;
++                nvkvm_plane_helpers.atomic_check = nvkvm_plane_check;
++                drm_plane_helper_add(pl, &nvkvm_plane_helpers);
++
+ 
+ 		/* The blob built during init used the helper's LINEAR-only
+ 		 * filter; rebuild it now that the callback above is ours. */

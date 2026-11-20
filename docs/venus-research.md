@@ -1,5 +1,9 @@
 ## Venus research tools
 
+The separate [nvkvm-pv investigation](nvkvm-research.md) compares a pinned
+NVIDIA forwarding prototype with the packaged Venus backend. It does not change
+the production backend or AMD support.
+
 These developer tools and saved reports are separate from the packaged runtime.
 Historical NVIDIA-forwarding comparisons require the launcher/runtime from that
 revision; the production launcher now has only Venus. Existing measurement files

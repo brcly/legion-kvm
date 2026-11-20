@@ -9,7 +9,7 @@ use smithay::{
     },
 };
 use std::{
-    os::fd::OwnedFd,
+    os::fd::{AsFd, BorrowedFd, OwnedFd},
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -66,6 +66,9 @@ pub(crate) struct Watch {
     barrier: Barrier,
 }
 impl Watch {
+    pub fn as_fd(&self) -> BorrowedFd<'_> {
+        self.event.as_fd()
+    }
     pub fn pending(surface: &WlSurface) -> Result<Option<Self>> {
         let point = with_states(surface, |states| {
             states

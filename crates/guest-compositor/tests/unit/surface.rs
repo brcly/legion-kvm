@@ -13,8 +13,8 @@ use std::{
 use wayland_client::{
     Connection, Dispatch, Proxy, QueueHandle, delegate_noop,
     protocol::{
-        wl_buffer, wl_callback, wl_compositor, wl_keyboard, wl_pointer, wl_registry, wl_seat,
-        wl_shm, wl_shm_pool, wl_subcompositor, wl_subsurface, wl_surface,
+        wl_buffer, wl_callback, wl_compositor, wl_keyboard, wl_output, wl_pointer, wl_registry,
+        wl_seat, wl_shm, wl_shm_pool, wl_subcompositor, wl_subsurface, wl_surface,
     },
 };
 use wayland_protocols::wp::{
@@ -25,6 +25,7 @@ use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_ba
 
 #[derive(Default)]
 struct Client {
+    output_modes: Vec<(i32, i32, i32)>,
     compositor: Option<wl_compositor::WlCompositor>,
     subcompositor: Option<wl_subcompositor::WlSubcompositor>,
     shm: Option<wl_shm::WlShm>,
@@ -69,6 +70,9 @@ impl Dispatch<wl_registry::WlRegistry, ()> for Client {
                 "wl_seat" => {
                     registry.bind::<wl_seat::WlSeat, _, _>(name, version.min(7), qh, ());
                 }
+                "wl_output" => {
+                    registry.bind::<wl_output::WlOutput, _, _>(name, version.min(4), qh, ());
+                }
                 "zwp_relative_pointer_manager_v1" => {
                     state.relative_manager = Some(registry.bind(name, 1, qh, ()))
                 }
@@ -79,6 +83,73 @@ impl Dispatch<wl_registry::WlRegistry, ()> for Client {
             }
         }
     }
+}
+impl Dispatch<wl_output::WlOutput, ()> for Client {
+    fn event(
+        state: &mut Self,
+        _: &wl_output::WlOutput,
+        event: wl_output::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let wl_output::Event::Mode {
+            flags,
+            width,
+            height,
+            refresh,
+            ..
+        } = event
+            && flags
+                .into_result()
+                .is_ok_and(|mode| mode.contains(wl_output::Mode::Current))
+        {
+            state.output_modes.push((width, height, refresh));
+        }
+    }
+}
+
+#[test]
+fn kms_refresh_reaches_the_wayland_client_in_millihertz() {
+    let mut display = Display::<State>::new().expect("owned display");
+    let mut handle = display.handle();
+    let mut state = State::forwarding(&handle, Vec::new(), 1, 1920, 1080).expect("GPU-free state");
+    state.set_output_refresh(240_000).expect("240 Hz KMS head");
+    for invalid in [0, 999, 1_000_001, u32::MAX] {
+        assert!(state.set_output_refresh(invalid).is_err());
+    }
+    let (server, socket) = UnixStream::pair().expect("owned sockets");
+    handle
+        .insert_client(server, Arc::new(ClientState::default()))
+        .expect("owned client");
+    let (send, receive) = mpsc::sync_channel(1);
+    let worker = std::thread::spawn(move || {
+        let connection = Connection::from_socket(socket).expect("owned connection");
+        let mut queue = connection.new_event_queue::<Client>();
+        let _registry = connection.display().get_registry(&queue.handle(), ());
+        let mut client = Client::default();
+        queue.roundtrip(&mut client).expect("registry");
+        queue.roundtrip(&mut client).expect("output mode");
+        send.send(client.output_modes).expect("mode result");
+    });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let modes = loop {
+        display
+            .dispatch_clients(&mut state)
+            .expect("owned dispatch");
+        display.flush_clients().expect("owned flush");
+        if let Ok(modes) = receive.try_recv() {
+            break modes;
+        }
+        assert!(Instant::now() < deadline, "output mode was never announced");
+        std::thread::sleep(Duration::from_millis(1));
+    };
+    worker.join().expect("owned client");
+    assert!(
+        modes.contains(&(1920, 1080, 240_000)),
+        "client saw {modes:?}"
+    );
+    assert!(!modes.iter().any(|mode| mode.2 == 60_000));
 }
 impl Dispatch<wl_seat::WlSeat, ()> for Client {
     fn event(

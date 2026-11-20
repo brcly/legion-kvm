@@ -1,0 +1,47 @@
+--- a/ui/sdl2.c
++++ b/ui/sdl2.c
+@@ -979,6 +979,13 @@
+ 
+ void sdl2_poll_events(struct sdl2_console *scon)
+ {
++    /* Frame-driven pumping may be reached again through expose/redraw while
++     * handling an SDL event. One global SDL queue, one active dispatcher. */
++    static bool pumping;
++    if (pumping) {
++        return;
++    }
++    pumping = true;
+     SDL_Event ev1, *ev = &ev1;
+     bool allow_close = true;
+     int idle = 1;
+@@ -1043,6 +1050,7 @@
+         scon->idle_counter = 0;
+         scon->dcl.update_interval = SDL2_REFRESH_INTERVAL_BUSY;
+     }
++    pumping = false;
+ }
+ 
+ static void sdl_mouse_warp(DisplayChangeListener *dcl,
+--- a/ui/sdl2-gl.c
++++ b/ui/sdl2-gl.c
+@@ -327,6 +327,20 @@
+     int ww, wh;
+ 
+     assert(scon->opengl);
++    /* Research opt-in: service input on real scanout work instead of waiting
++     * for the 10/30 ms GUI refresh timer. Idle timers are unchanged. Poll before
++     * taking GL state because expose/resize events may redraw this window. */
++    static int frame_input = -1;
++    if (frame_input < 0) {
++        const char *value = getenv("LEGION_SDL_FRAME_INPUT");
++        frame_input = value && !strcmp(value, "1");
++        if (frame_input) {
++            fprintf(stderr, "LEGION_SDL_FRAME_INPUT enabled=1 scope=active-scanout\n");
++        }
++    }
++    if (frame_input) {
++        sdl2_poll_events(scon);
++    }
+     if (!scon->scanout_mode) {
+         return;
+     }

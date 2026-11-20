@@ -1,0 +1,26 @@
+--- a/src/guest/nvkvm_kms.c
++++ b/src/guest/nvkvm_kms.c
+@@ -1293,6 +1293,12 @@
+ 	struct nvkvm_kms *kms;
+ 	int ret;
+ 
++	/* DRM managed actions run in reverse registration order. The mode
++	 * objects live inside kms, so their cleanup must precede its free. */
++	kms = drmm_kzalloc(ddev, sizeof(*kms), GFP_KERNEL);
++	if (!kms)
++		return -ENOMEM;
++
+ 	ret = drmm_mode_config_init(ddev);
+ 	if (ret)
+ 		return ret;
+@@ -1315,10 +1321,6 @@
+ 	if (ret)
+ 		return ret;
+ 
+-	kms = drmm_kzalloc(ddev, sizeof(*kms), GFP_KERNEL);
+-	if (!kms)
+-		return -ENOMEM;
+-
+ 	nvkvm_hrtimer_setup(&kms->vblank, nvkvm_vblank_fn,
+ 			    CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+ 	nvkvm_hrtimer_setup(&kms->bp_timer, nvkvm_bp_timer_fn,

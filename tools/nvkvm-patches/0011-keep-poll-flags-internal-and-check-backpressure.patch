@@ -1,0 +1,50 @@
+--- a/src/qemu/nvkvm_isolate.c
++++ b/src/qemu/nvkvm_isolate.c
+@@ -3779,7 +3779,7 @@
+ 	struct isolate_cmd_poll cmd = {
+ 		.type      = ISOLATE_CMD_POLL,
+ 		.handle_id = handle_id,
+-		.events    = events,
++		.events    = events & ~ISOLATE_POLL_NOACK,
+ 	};
+ 	return sync_send_recv(iso, &cmd, sizeof(cmd));
+ }
+--- a/tests/unit/test_isolate.c
++++ b/tests/unit/test_isolate.c
+@@ -22,12 +22,14 @@
+ #include <pthread.h>
+ #include <sys/mman.h>
+ #include <poll.h>
++#include <signal.h>
+ 
+ /* Stub QEMU osdep for the isolate implementation */
+ #include "stubs/qemu/osdep.h"
+ 
+ #include "../../src/qemu/nvkvm_handle.h"
+ #include "../../src/qemu/nvkvm_isolate.h"
++#include "../../src/common/nvkvm_isolate_proto.h"
+ 
+ /* ── Minimal test framework ───────────────────────────────────────────────── */
+ 
+@@ -350,6 +352,21 @@
+ 		 * command must still receive its own response, without deadlock. */
+ 		EXPECT_EQ(nvkvm_isolate_unpoll(&g_it, iso_id, 1), 0);
+ 	}
++	/* A caller cannot select the host-internal no-ACK flag through events. */
++	EXPECT_EQ(nvkvm_isolate_poll(&g_it, iso_id, 1,
++				    POLLIN | ISOLATE_POLL_NOACK), 0);
++	/* A stalled helper must produce bounded backpressure rather than hold
++	 * the QEMU main loop in a blocking socket send. Only stop our child. */
++	pid_t child = nvkvm_isolate_host_pid(&g_it, iso_id);
++	EXPECT_GE(child, 2);
++	EXPECT_EQ(kill(child, SIGSTOP), 0);
++	int result = 0;
++	for (unsigned i = 0; i < 4096 && !result; i++)
++		result = nvkvm_isolate_poll_enqueue(&g_it, iso_id, 1, POLLIN);
++	int resumed = kill(child, SIGCONT);
++	EXPECT_EQ(resumed, 0);
++	EXPECT_EQ(result, -EAGAIN);
++	EXPECT_EQ(nvkvm_isolate_unpoll(&g_it, iso_id, 1), 0);
+ 	EXPECT_EQ(nvkvm_isolate_kill(&g_it, iso_id), 0);
+ 	EXPECT_EQ(nvkvm_isolate_poll_enqueue(&g_it, iso_id, 1, POLLIN), -ENOENT);
+ 	fixture_fini();

@@ -1,0 +1,31 @@
+--- a/src/qemu/virtio_nvgpu.c
++++ b/src/qemu/virtio_nvgpu.c
+@@ -795,6 +795,8 @@
+  * vq_evt callback (nvkvm_evt_callback → nvkvm_evt_deliver) matches the buffer's
+  * (isolate_id, handle_id) to the waiting fd's poll_wq and wakes it.  Without this
+  * libnvidia falls back to an ~18 ms poll-timeout-recheck per blocking-sync wait. */
++static uint64_t nvkvm_poll_events_delivered, nvkvm_poll_events_dropped;
++
+ struct nvkvm_evt_push {
+ 	VirtIONvgpu *nv;
+ 	uint32_t     isolate_id;
+@@ -817,8 +819,10 @@
+ 			       iov_from_buf(elem->in_sg, elem->in_num, 0,
+ 					    &msg, sizeof(msg)));
+ 		virtio_notify(VIRTIO_DEVICE(p->nv), p->nv->vq_evt);
++		nvkvm_poll_events_delivered++;
+ 		g_free(elem);
+ 	} else {
++		nvkvm_poll_events_dropped++;
+ 		/* No pre-posted evt buffer free right now.  The guest re-arms its
+ 		 * poll and the still-readable host fd re-fires, so this is
+ 		 * recoverable (one missed wake, not a lost completion). */
+@@ -959,6 +963,8 @@
+ 
+ static void nvkvm_request_stats_dump(void)
+ {
++    fprintf(stderr, "nvkvm poll events: delivered=%" PRIu64 " dropped=%" PRIu64 "\n",
++            nvkvm_poll_events_delivered, nvkvm_poll_events_dropped);
+     for (unsigned i = 0; i < ARRAY_SIZE(nvkvm_request_counts); i++) {
+         if (nvkvm_request_counts[i]) {
+             fprintf(stderr, "nvkvm request total: type=%u count=%" PRIu64 "\n",

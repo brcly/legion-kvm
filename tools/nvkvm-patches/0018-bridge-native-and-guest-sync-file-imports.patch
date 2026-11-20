@@ -1,0 +1,668 @@
+--- a/src/common/nvkvm_isolate_proto.h
++++ b/src/common/nvkvm_isolate_proto.h
+@@ -58,6 +58,7 @@
+ #define ISOLATE_CMD_PRESENT_EXPORT 14 /* PRIME_HANDLE_TO_FD a GEM; reply w/ dma-buf via SCM */
+ #define ISOLATE_CMD_XISO_IMPORT  15   /* #110 cross-isolate: PRIME_FD_TO_HANDLE a dma-buf
+ 				       * (arrives via SCM_RIGHTS) → reply w/ GEM handle */
++#define ISOLATE_CMD_IMPORT_SYNC_FILE 18 /* optional SCM fd, replies OK/ERROR */
+ #define ISOLATE_CMD_EXPORT_SYNC_FILE 17 /* canonical SEMSURF fence export + SCM_RIGHTS */
+ #define ISOLATE_CMD_WINDOW_INFO  16   /* U-9: report the guest-mapping window's base+size */
+ 
+@@ -197,6 +198,11 @@
+ 
+ /* Uses the serialized OPEN_DEVICE fd-response slot; output handle is minted
+  * by QEMU before dispatch, so the stub can store the native fd immediately. */
++struct isolate_cmd_import_sync_file {
++	uint32_t type, render_handle, fence_context_handle, flags;
++	uint64_t pre_wait_value, post_wait_value;
++};
++
+ struct isolate_cmd_export_sync_file {
+ 	uint32_t type;
+ 	uint32_t render_handle;
+--- a/src/common/nvkvm_proto.h
++++ b/src/common/nvkvm_proto.h
+@@ -66,6 +66,7 @@
+ #define NVKVM_CONFIG_F_GRAPHICS  (1ULL << 0)
+ /* Real host sync_file export/status transport; graphics-gated, opt-in. */
+ #define NVKVM_CONFIG_F_SYNC_FILE (1ULL << 1)
++#define NVKVM_CONFIG_F_SYNC_FILE_IMPORT (1ULL << 2)
+ 
+ /* ── Protocol version ────────────────────────────────────────────────────── */
+ 
+@@ -184,6 +185,7 @@
+ 	                                           * the caller-local stub GEM handle            */
+ 	NVKVM_REQ_EXPORT_SYNC_FILE = 32,
+ 	NVKVM_REQ_SYNC_FILE_STATUS = 33,
++	NVKVM_REQ_IMPORT_SYNC_FILE = 34,
+ };
+ 
+ /* ── Generic header ──────────────────────────────────────────────────────── */
+@@ -525,6 +527,16 @@
+ 	__le32 handle_id;
+ 	__le32 status;
+ };
++/* Source handles name genuine host sync_files. SIGNALED has no source handle
++ * and is sent only after a guest fence actually completes. Same-VM sharing
++ * follows XISO_IMPORT: both isolate/handle principals are checked separately. */
++struct nvkvm_req_import_sync_file {
++	__le32 isolate_id, render_handle, fence_context_handle;
++	__le32 owner_isolate_id, owner_handle, flags;
++	__le64 pre_wait_value, post_wait_value;
++};
++struct nvkvm_resp_import_sync_file { __le32 status, reserved; };
++
+ struct nvkvm_req_sync_file_status {
+ 	__le32 isolate_id;
+ 	__le32 handle_id;
+--- a/src/common/nvkvm_sync_file_abi.h
++++ b/src/common/nvkvm_sync_file_abi.h
+@@ -4,4 +4,6 @@
+ #define NVKVM_DEV_SYNC_FILE 254u
+ /* drm_nvidia_semsurf_fence_create_params: 24 bytes, OUT fd at byte 16. */
+ #define NVKVM_SYNC_FILE_FENCE_CREATE 0xc0186455u
++#define NVKVM_SYNC_FILE_FENCE_WAIT 0x40186456u
++#define NVKVM_SYNC_IMPORT_SIGNALED 1u
+ #endif
+--- a/src/guest/nvkvm.h
++++ b/src/guest/nvkvm.h
+@@ -316,6 +316,13 @@
+ 	 * ref drops, which also keeps the stub-side bo alive for the importer.
+ 	 */
+ 	refcount_t             refs;
++
++#ifdef NVKVM_GRAPHICS
++	struct mutex sync_imports_lock;
++	struct list_head sync_imports;
++	unsigned int sync_imports_count;
++	bool sync_imports_closed;
++#endif
+ 
+ 	/* poll support */
+ 	struct work_struct     poll_work;
+@@ -561,10 +568,17 @@
+ int nvkvm_virtio_export_sync_file(struct nvkvm_fd_ctx *owner,
+     __u32 fence_context, __u32 timeout_ms, __u64 wait_value, __u32 *handle);
+ int nvkvm_virtio_sync_file_status(struct nvkvm_fd_ctx *ctx, int *status);
++int nvkvm_virtio_import_sync_file(struct nvkvm_fd_ctx *target, __u32 context,
++    struct nvkvm_fd_ctx *source, __u64 pre, __u64 post);
+ struct nvkvm_fd_ctx *nvkvm_fd_ctx_adopt_sync_file(
+     struct nvkvm_fd_ctx *owner, __u32 handle);
+ #ifdef NVKVM_GRAPHICS
+ struct dma_fence;
++struct drm_gem_object;
++void nvkvm_sync_imports_init(struct nvkvm_fd_ctx *ctx);
++void nvkvm_sync_imports_cancel(struct nvkvm_fd_ctx *ctx);
++int nvkvm_sync_file_import(struct nvkvm_fd_ctx *target, struct drm_gem_object *context,
++    __u32 stub_context, int fd, __u64 pre, __u64 post);
+ int nvkvm_sync_file_init(void);
+ void nvkvm_sync_file_fini(void);
+ struct dma_fence *nvkvm_sync_fence_export(struct nvkvm_fd_ctx *owner,
+--- a/src/guest/nvkvm_drm.c
++++ b/src/guest/nvkvm_drm.c
+@@ -705,6 +705,31 @@
+ 		return fd;
+ 	p->fd = fd;
+ 	return 0;
++}
++
++struct nvkvm_semsurf_fence_wait_params {
++	__u32 fence_context_handle;
++	__s32 fd;
++	__u64 pre_wait_value, post_wait_value;
++};
++
++static int nvkvm_drm_semsurf_fence_wait(struct drm_device *dev,
++    void *data, struct drm_file *file)
++{
++	struct nvkvm_semsurf_fence_wait_params *p = data;
++	struct nvkvm_fd_ctx *ctx = file->driver_priv;
++	if (!ctx || !nvkvm.sync_file_bridge)
++		return -EOPNOTSUPP;
++	if (p->pre_wait_value >= p->post_wait_value)
++		return -EINVAL;
++	struct drm_gem_object *context = drm_gem_object_lookup(file, p->fence_context_handle);
++	if (!context)
++		return -ENOENT;
++	__u32 stub_context = nvkvm_gem_to_stub(file, p->fence_context_handle);
++	int ret = stub_context ? nvkvm_sync_file_import(ctx, context, stub_context,
++		p->fd, p->pre_wait_value, p->post_wait_value) : -ENOENT;
++	drm_gem_object_put(context);
++	return ret;
+ }
+ 
+ struct nvkvm_semsurf_fence_attach_params {
+@@ -1167,6 +1192,9 @@
+ 				   struct drm_nvidia_semsurf_fence_create_params),
+ 		   .func = nvkvm_drm_fwd_semsurf_fence_create,
+ 		   .flags = DRM_RENDER_ALLOW, .name = "NVIDIA_SEMSURF_FENCE_CREATE" },
++	[0x16] = { .cmd = DRM_IOW(NVKVM_DRM_COMMAND_BASE + 0x16, struct nvkvm_semsurf_fence_wait_params),
++	  .func = nvkvm_drm_semsurf_fence_wait, .flags = DRM_RENDER_ALLOW,
++	  .name = "NVIDIA_SEMSURF_FENCE_WAIT" },
+ 	[0x17] = { .cmd = DRM_IOW(NVKVM_DRM_COMMAND_BASE + 0x17, struct nvkvm_semsurf_fence_attach_params),
+ 	  .func = nvkvm_drm_fwd_semsurf_fence_attach,
+ 	  .flags = DRM_RENDER_ALLOW, .name = "NVIDIA_SEMSURF_FENCE_ATTACH" },
+@@ -1242,6 +1270,7 @@
+ 
+ 	(void)dev;
+ 	if (ctx) {
++		nvkvm_sync_imports_cancel(ctx);
+ 		nvkvm_fd_ctx_close(ctx);
+ 		file->driver_priv = NULL;
+ 	}
+--- a/src/guest/nvkvm_main.c
++++ b/src/guest/nvkvm_main.c
+@@ -750,6 +750,9 @@
+ 		return ERR_PTR(ret);
+ 	}
+ 	INIT_WORK(&ctx->poll_work, nvkvm_poll_arm_work);
++#ifdef NVKVM_GRAPHICS
++	nvkvm_sync_imports_init(ctx);
++#endif
+ 	init_waitqueue_head(&ctx->poll_wq);
+ 	atomic_set(&ctx->poll_events, 0);
+ 	atomic_set(&ctx->poll_armed, 0);   /* #127 */
+@@ -792,6 +795,9 @@
+ 	ctx->session->refcount++;
+ 	mutex_unlock(&nvkvm.sessions_lock);
+ 	INIT_WORK(&ctx->poll_work, nvkvm_poll_arm_work);
++#ifdef NVKVM_GRAPHICS
++	nvkvm_sync_imports_init(ctx);
++#endif
+ 	init_waitqueue_head(&ctx->poll_wq);
+ 	atomic_set(&ctx->poll_events, 0);
+ 	atomic_set(&ctx->poll_armed, 0);
+--- a/src/guest/nvkvm_sync_file.c
++++ b/src/guest/nvkvm_sync_file.c
+@@ -7,6 +7,7 @@
+ #include <linux/slab.h>
+ #include <linux/sync_file.h>
+ #include <linux/workqueue.h>
++#include <drm/drm_gem.h>
+ #include "nvkvm.h"
+ 
+ static struct workqueue_struct *sync_wq;
+@@ -154,6 +155,146 @@
+ 	return fd;
+ }
+ 
++/* Guest-created fences have no native descriptor. Keep the GPU's semaphore
++ * wait asynchronous: acknowledge registration now, and ask the host driver
++ * to advance pre -> post only after the actual guest fence completes. No
++ * worker is parked on an unsignalled fence, so a full set of imports cannot
++ * starve the export monitors or their cleanup work. */
++struct nvkvm_sync_import {
++	struct dma_fence *fence;
++	struct dma_fence_cb callback;
++	struct drm_gem_object *context;
++	struct nvkvm_fd_ctx *target;
++	struct list_head node;
++	struct work_struct work;
++	atomic_t scheduled;
++	__u32 stub_context;
++	__u64 pre, post;
++};
++
++void nvkvm_sync_imports_init(struct nvkvm_fd_ctx *ctx)
++{
++	mutex_init(&ctx->sync_imports_lock);
++	INIT_LIST_HEAD(&ctx->sync_imports);
++}
++
++static void sync_import_schedule(struct nvkvm_sync_import *import)
++{
++	/* Completion and file close may race. Queue/free this work exactly once,
++	 * including when cancellation sees work that has already started. */
++	if (atomic_cmpxchg(&import->scheduled, 0, 1) == 0)
++		queue_work(sync_wq, &import->work);
++}
++
++static void sync_import_ready(struct dma_fence *fence, struct dma_fence_cb *cb)
++{
++	struct nvkvm_sync_import *import = container_of(cb, struct nvkvm_sync_import, callback);
++	sync_import_schedule(import);
++}
++
++void nvkvm_sync_imports_cancel(struct nvkvm_fd_ctx *ctx)
++{
++	struct nvkvm_sync_import *import;
++	mutex_lock(&ctx->sync_imports_lock);
++	ctx->sync_imports_closed = true;
++	list_for_each_entry(import, &ctx->sync_imports, node) {
++		dma_fence_remove_callback(import->fence, &import->callback);
++		sync_import_schedule(import);
++	}
++	mutex_unlock(&ctx->sync_imports_lock);
++}
++
++static void sync_import_finish(struct work_struct *work)
++{
++	struct nvkvm_sync_import *import = container_of(work, struct nvkvm_sync_import, work);
++	struct nvkvm_fd_ctx *target = import->target;
++	/* Serializes with an in-flight fence callback before its storage is freed. */
++	dma_fence_remove_callback(import->fence, &import->callback);
++	mutex_lock(&target->sync_imports_lock);
++	bool closed = target->sync_imports_closed;
++	list_del(&import->node);
++	target->sync_imports_count--;
++	mutex_unlock(&target->sync_imports_lock);
++	int status = dma_fence_get_status(import->fence);
++	if (!closed && status == 1 && nvkvm_transport_ready(&nvkvm)) {
++		int ret = nvkvm_virtio_import_sync_file(target, import->stub_context,
++			NULL, import->pre, import->post);
++		if (ret)
++			pr_warn_ratelimited("nvkvm: deferred sync import registration failed: %d\n", ret);
++	} else if (!closed && status < 0) {
++		/* Never convert a failed producer into successful GPU completion. */
++		pr_warn_ratelimited("nvkvm: sync import producer failed: %d\n", status);
++	}
++	dma_fence_put(import->fence);
++	drm_gem_object_put(import->context);
++	nvkvm_fd_ctx_put(target);
++	kfree(import);
++	module_put(THIS_MODULE);
++}
++
++int nvkvm_sync_file_import(struct nvkvm_fd_ctx *target, struct drm_gem_object *context,
++    __u32 stub_context, int fd, __u64 pre, __u64 post)
++{
++	struct dma_fence *fence = sync_file_get_fence(fd);
++	if (!fence)
++		return -EINVAL;
++	int status = dma_fence_get_status(fence);
++	int ret;
++	if (status < 0) {
++		ret = status;
++		goto out;
++	}
++	if (fence->ops == &sync_ops) {
++		struct nvkvm_sync_fence *nf = container_of(fence, struct nvkvm_sync_fence, base);
++		ret = nvkvm_virtio_import_sync_file(target, stub_context, nf->ctx, pre, post);
++		goto out;
++	}
++	if (status == 1) {
++		ret = nvkvm_virtio_import_sync_file(target, stub_context, NULL, pre, post);
++		goto out;
++	}
++	struct nvkvm_sync_import *import = kzalloc(sizeof(*import), GFP_KERNEL);
++	if (!import) {
++		ret = -ENOMEM;
++		goto out;
++	}
++	if (!try_module_get(THIS_MODULE)) {
++		kfree(import);
++		ret = -ENODEV;
++		goto out;
++	}
++	import->fence = fence;
++	import->context = context;
++	import->target = target;
++	import->stub_context = stub_context;
++	import->pre = pre;
++	import->post = post;
++	INIT_WORK(&import->work, sync_import_finish);
++	atomic_set(&import->scheduled, 0);
++	mutex_lock(&target->sync_imports_lock);
++	if (target->sync_imports_closed || target->sync_imports_count >= 4096) {
++		mutex_unlock(&target->sync_imports_lock);
++		module_put(THIS_MODULE);
++		kfree(import);
++		ret = -EBUSY;
++		goto out;
++	}
++	nvkvm_fd_ctx_get(target);
++	drm_gem_object_get(context);
++	list_add(&import->node, &target->sync_imports);
++	target->sync_imports_count++;
++	mutex_unlock(&target->sync_imports_lock);
++	/* ioctl holds the file alive through callback registration. postclose
++	 * cannot cancel an import until this registration has finished. */
++	ret = dma_fence_add_callback(fence, &import->callback, sync_import_ready);
++	if (ret) /* Already terminal; finish checks the actual status. */
++		sync_import_schedule(import);
++	return 0; /* work owns the fence and destination references */
++out:
++	dma_fence_put(fence);
++	return ret;
++}
++
+ int nvkvm_sync_file_init(void)
+ {
+ 	sync_wq = alloc_workqueue("nvkvm-sync", WQ_UNBOUND | WQ_MEM_RECLAIM, 0);
+--- a/src/guest/nvkvm_virtio.c
++++ b/src/guest/nvkvm_virtio.c
+@@ -203,7 +203,7 @@
+ 	/* The protocol deliberately has one legacy block and one current block. */
+ 	return (type >= NVKVM_REQ_OPEN && type <= NVKVM_REQ_MUNMAP) ||
+ 	       (type >= NVKVM_REQ_LIST_NVIDIA_DEVICES &&
+-		type <= NVKVM_REQ_SYNC_FILE_STATUS);
++		type <= NVKVM_REQ_IMPORT_SYNC_FILE);
+ }
+ 
+ /* ── VQ_TX completion callback — called from softirq context ─────────────── */
+@@ -385,6 +385,11 @@
+ 			struct nvkvm_resp_export_sync_file *resp = (void *)(hdr + 1);
+ 			inf->status = le32_to_cpu(resp->status);
+ 			inf->retval = le32_to_cpu(resp->handle_id);
++			break;
++		}
++		case NVKVM_REQ_IMPORT_SYNC_FILE: {
++			struct nvkvm_resp_import_sync_file *resp = (void *)(hdr + 1);
++			inf->status = le32_to_cpu(resp->status);
+ 			break;
+ 		}
+ 		case NVKVM_REQ_SYNC_FILE_STATUS: {
+@@ -1008,7 +1013,8 @@
+ 
+ 	state->sync_file_bridge = state->graphics_enabled &&
+ 		(virtio_cread64(vdev, offsetof(struct nvkvm_virtio_config, flags)) &
+-		 NVKVM_CONFIG_F_SYNC_FILE) != 0;
++		 (NVKVM_CONFIG_F_SYNC_FILE | NVKVM_CONFIG_F_SYNC_FILE_IMPORT)) ==
++		(NVKVM_CONFIG_F_SYNC_FILE | NVKVM_CONFIG_F_SYNC_FILE_IMPORT);
+ 
+ 	if (state->sync_file_bridge)
+ 		pr_info("nvkvm: experimental host sync_file bridge negotiated\n");
+@@ -1154,6 +1160,24 @@
+ 	if (!ret)
+ 		*handle = (__u32)value;
+ 	return ret;
++}
++
++int nvkvm_virtio_import_sync_file(struct nvkvm_fd_ctx *target, __u32 context,
++    struct nvkvm_fd_ctx *source, __u64 pre, __u64 post)
++{
++	struct { struct nvkvm_hdr hdr; struct nvkvm_req_import_sync_file req; } msg = {0};
++	msg.req.isolate_id = cpu_to_le32(target->session->isolate_id);
++	msg.req.render_handle = cpu_to_le32(target->handle_id);
++	msg.req.fence_context_handle = cpu_to_le32(context);
++	msg.req.pre_wait_value = cpu_to_le64(pre);
++	msg.req.post_wait_value = cpu_to_le64(post);
++	if (source) {
++		msg.req.owner_isolate_id = cpu_to_le32(source->session->isolate_id);
++		msg.req.owner_handle = cpu_to_le32(source->handle_id);
++	} else {
++		msg.req.flags = cpu_to_le32(NVKVM_SYNC_IMPORT_SIGNALED);
++	}
++	return simple_req(NVKVM_REQ_IMPORT_SYNC_FILE, &msg, sizeof(msg), NULL);
+ }
+ 
+ int nvkvm_virtio_sync_file_status(struct nvkvm_fd_ctx *ctx, int *status)
+--- a/src/qemu/nvkvm_isolate.c
++++ b/src/qemu/nvkvm_isolate.c
+@@ -3294,6 +3294,41 @@
+ 	return nvkvm_isolate_command_fd(iso, &cmd, sizeof(cmd), fd_out);
+ }
+ 
++int nvkvm_isolate_import_sync_file(struct nvkvm_isolate_table *t,
++    uint32_t isolate_id, uint32_t render_handle, uint32_t context,
++    int sync_fd, uint64_t pre, uint64_t post)
++{
++	if (!isolate_id || isolate_id >= NVKVM_ISOLATE_MAX)
++		return -ENOENT;
++	if (pre >= post || sync_fd < -1)
++		return -EINVAL;
++	struct nvkvm_isolate *iso = &t->isolates[isolate_id];
++	pthread_mutex_lock(&iso->lock);
++	bool valid = iso->in_use && iso->id == isolate_id && iso->alive;
++	pthread_mutex_unlock(&iso->lock);
++	if (!valid)
++		return -ENOENT;
++	struct isolate_cmd_import_sync_file cmd = {
++		.type = ISOLATE_CMD_IMPORT_SYNC_FILE,
++		.render_handle = render_handle,
++		.fence_context_handle = context,
++		.flags = sync_fd < 0 ? NVKVM_SYNC_IMPORT_SIGNALED : 0,
++		.pre_wait_value = pre, .post_wait_value = post,
++	};
++	if (sync_fd < 0)
++		return sync_send_recv(iso, &cmd, sizeof(cmd));
++	struct iovec iov = { .iov_base = &cmd, .iov_len = sizeof(cmd) };
++	char control[CMSG_SPACE(sizeof(int))] = {0};
++	struct msghdr msg = { .msg_iov = &iov, .msg_iovlen = 1,
++		.msg_control = control, .msg_controllen = sizeof(control) };
++	struct cmsghdr *cm = CMSG_FIRSTHDR(&msg);
++	cm->cmsg_level = SOL_SOCKET;
++	cm->cmsg_type = SCM_RIGHTS;
++	cm->cmsg_len = CMSG_LEN(sizeof(int));
++	memcpy(CMSG_DATA(cm), &sync_fd, sizeof(sync_fd));
++	return sync_sendmsg_recv(iso, &msg);
++}
++
+ int nvkvm_isolate_export_sync_file(struct nvkvm_isolate_table *t,
+     uint32_t isolate_id, uint32_t render_handle, uint32_t output_handle,
+     uint32_t fence_context_handle, uint32_t timeout_ms, uint64_t wait_value,
+--- a/src/qemu/nvkvm_isolate.h
++++ b/src/qemu/nvkvm_isolate.h
+@@ -596,6 +596,9 @@
+ /*
+  * Register/deregister poll on a handle in the isolate.
+  */
++int nvkvm_isolate_import_sync_file(struct nvkvm_isolate_table *t,
++    uint32_t isolate_id, uint32_t render_handle, uint32_t context,
++    int sync_fd, uint64_t pre, uint64_t post);
+ int nvkvm_isolate_export_sync_file(struct nvkvm_isolate_table *t,
+     uint32_t isolate_id, uint32_t render_handle, uint32_t output_handle,
+     uint32_t fence_context_handle, uint32_t timeout_ms, uint64_t wait_value,
+--- a/src/qemu/nvkvm_isolate_handlers.c
++++ b/src/qemu/nvkvm_isolate_handlers.c
+@@ -5334,6 +5334,56 @@
+ 	return 0;
+ }
+ 
++/* Same-VM fence sharing uses the same access-model split as XISO_IMPORT:
++ * Linux guest fd rights authorize the source; QEMU validates both independent
++ * (isolate, handle) principals and never accepts a guest-provided host fd. */
++int nvkvm_req_import_sync_file(VirtIONvgpu *nv,
++    struct nvkvm_req_import_sync_file *req, struct nvkvm_resp_import_sync_file *resp)
++{
++	resp->status = EPERM;
++	if (!nv->graphics || !nv->sync_file_bridge ||
++	    !poll_pair_ok(nv, req->render_handle, req->isolate_id))
++		return 0;
++	struct nvkvm_handle *render = nvkvm_handle_get(&nv->handles, req->render_handle);
++	if (!render || render->type != NVKVM_HANDLE_TYPE_NVIDIA ||
++	    render->dev_id < 32 || render->dev_id >= 48)
++		return 0;
++	if (req->pre_wait_value >= req->post_wait_value ||
++	    (req->flags & ~NVKVM_SYNC_IMPORT_SIGNALED)) {
++		resp->status = EINVAL;
++		return 0;
++	}
++	int fd = -1;
++	if (req->flags & NVKVM_SYNC_IMPORT_SIGNALED) {
++		if (req->owner_isolate_id || req->owner_handle) {
++			resp->status = EINVAL;
++			return 0;
++		}
++	} else {
++		uint32_t source_session = 0;
++		fd = nvkvm_handle_acquire_sync_file(&nv->handles, req->owner_handle, &source_session);
++		if (fd < 0) {
++			resp->status = (uint32_t)-fd;
++			return 0;
++		}
++		if (!session_has_isolate(nv, source_session, req->owner_isolate_id)) {
++			close(fd);
++			return 0;
++		}
++	}
++	int ret = nvkvm_isolate_import_sync_file(&nv->isolates, req->isolate_id,
++		req->render_handle, req->fence_context_handle, fd,
++		req->pre_wait_value, req->post_wait_value);
++	if (fd >= 0)
++		close(fd);
++	NVKVM_DBG("nvkvm sync import: isolate=%u context=%u source=%u:%u flags=%u pre=%llu post=%llu ret=%d\n",
++		req->isolate_id, req->fence_context_handle, req->owner_isolate_id,
++		req->owner_handle, req->flags, (unsigned long long)req->pre_wait_value,
++		(unsigned long long)req->post_wait_value, ret);
++	resp->status = ret < 0 ? (uint32_t)-ret : 0;
++	return 0;
++}
++
+ int nvkvm_req_sync_file_status(VirtIONvgpu *nv,
+     struct nvkvm_req_sync_file_status *req,
+     struct nvkvm_resp_sync_file_status *resp)
+--- a/src/qemu/virtio_nvgpu.c
++++ b/src/qemu/virtio_nvgpu.c
+@@ -1107,6 +1107,10 @@
+ 			    nvkvm_req_export_sync_file,
+ 			    nvkvm_resp_export_sync_file,
+ 			    nvkvm_req_export_sync_file)
++		ISOLATE_REQ(NVKVM_REQ_IMPORT_SYNC_FILE,
++			    nvkvm_req_import_sync_file,
++			    nvkvm_resp_import_sync_file,
++			    nvkvm_req_import_sync_file)
+ 		ISOLATE_REQ(NVKVM_REQ_SYNC_FILE_STATUS,
+ 			    nvkvm_req_sync_file_status,
+ 			    nvkvm_resp_sync_file_status,
+@@ -1654,7 +1658,8 @@
+ 	/* Advertise the graphics capability to the guest (QEMU dictates). */
+ 	nv->config_space.flags = cpu_to_le64(
+ 		(nv->graphics ? NVKVM_CONFIG_F_GRAPHICS : 0) |
+-		(nv->graphics && nv->sync_file_bridge ? NVKVM_CONFIG_F_SYNC_FILE : 0));
++		(nv->graphics && nv->sync_file_bridge ?
++		 (NVKVM_CONFIG_F_SYNC_FILE | NVKVM_CONFIG_F_SYNC_FILE_IMPORT) : 0));
+ 	if (!nv->graphics)
+ 		info_report("nvkvm: graphics disabled (compute-only): DRM render "
+ 			    "node + NVKMS modeset device + ioctls refused");
+--- a/src/qemu/virtio_nvgpu.h
++++ b/src/qemu/virtio_nvgpu.h
+@@ -517,6 +517,8 @@
+ int nvkvm_req_export_sync_file(VirtIONvgpu *nv,
+     struct nvkvm_req_export_sync_file *req,
+     struct nvkvm_resp_export_sync_file *resp);
++int nvkvm_req_import_sync_file(VirtIONvgpu *nv,
++    struct nvkvm_req_import_sync_file *req, struct nvkvm_resp_import_sync_file *resp);
+ int nvkvm_req_sync_file_status(VirtIONvgpu *nv,
+     struct nvkvm_req_sync_file_status *req,
+     struct nvkvm_resp_sync_file_status *resp);
+--- a/src/stub/nvkvm_stub.c
++++ b/src/stub/nvkvm_stub.c
+@@ -31,6 +31,7 @@
+ #include <linux/audit.h>
+ #include <linux/futex.h>
+ #include <linux/elf.h>
++#include <linux/sync_file.h>
+ /*
+  * x86-64 only, and deliberately so. The port surface is not the C in this file
+  * -- it is stub_clone3.S, the inline syscall wrappers below, the self-relocation
+@@ -2196,6 +2197,101 @@
+ 		handle_remove(cmd->output_handle);
+ }
+ 
++/* A DRM CPU stub fence is device-independent and already signalled. It is
++ * used only for guest imports whose real producer has completed; it is never
++ * used to pretend that a pending producer finished. Reader-thread owned. */
++#ifndef MSG_CTRUNC
++#define MSG_CTRUNC 0x08
++#endif
++#ifndef MSG_TRUNC
++#define MSG_TRUNC 0x20
++#endif
++static int completed_sync_file = -1;
++
++static int get_completed_sync_file(int render)
++{
++	if (completed_sync_file >= 0)
++		return completed_sync_file;
++	struct { uint32_t handle, flags; } create = { .flags = 1 };
++	long ret = stub_ioctl(render, 0xc00864bfu, &create); /* SYNCOBJ_CREATE(SIGNALED) */
++	if (ret < 0)
++		return (int)ret;
++	struct { uint32_t handle, flags; int32_t fd; uint32_t pad; } export = {
++		.handle = create.handle, .flags = 1, .fd = -1,
++	};
++	ret = stub_ioctl(render, 0xc01064c1u, &export); /* HANDLE_TO_FD(EXPORT_SYNC_FILE) */
++	create.flags = 0;
++	stub_ioctl(render, 0xc00864c0u, &create); /* SYNCOBJ_DESTROY */
++	if (ret < 0)
++		return (int)ret;
++	if (export.fd < 0)
++		return -EIO;
++	completed_sync_file = export.fd;
++	return completed_sync_file;
++}
++
++static void handle_import_sync_file(const struct isolate_cmd_import_sync_file *cmd,
++    struct msghdr *msg, long length)
++{
++	int source = -1, count = 0;
++	struct cmsghdr *cm = CMSG_FIRSTHDR(msg);
++	if (cm && cm->cmsg_level == SOL_SOCKET && cm->cmsg_type == SCM_RIGHTS &&
++	    cm->cmsg_len >= CMSG_LEN(0) && cm->cmsg_len <= msg->msg_controllen) {
++		count = (int)((cm->cmsg_len - CMSG_LEN(0)) / sizeof(int));
++		for (int i = 0; i < count; i++) {
++			int fd;
++			__builtin_memcpy(&fd, (char *)CMSG_DATA(cm) + i * sizeof(fd), sizeof(fd));
++			if (i == 0)
++				source = fd;
++			else
++				stub_close(fd);
++		}
++	}
++	int ret = -EINVAL;
++	int render = -1;
++	if (length != (long)sizeof(*cmd) || (msg->msg_flags & (MSG_CTRUNC | MSG_TRUNC)) ||
++	    (cmd->flags & ~NVKVM_SYNC_IMPORT_SIGNALED) ||
++	    cmd->pre_wait_value >= cmd->post_wait_value)
++		goto done;
++	if ((cmd->flags & NVKVM_SYNC_IMPORT_SIGNALED) ? count != 0 : count != 1)
++		goto done;
++	uint32_t dev = handle_dev_lookup(cmd->render_handle);
++	render = handle_lookup(cmd->render_handle);
++	if (render < 0 || dev < 32 || dev >= 48) {
++		ret = -EBADF;
++		goto done;
++	}
++	int fence_fd = source;
++	if (cmd->flags & NVKVM_SYNC_IMPORT_SIGNALED)
++		fence_fd = get_completed_sync_file(render);
++	if (fence_fd < 0) {
++		ret = fence_fd;
++		goto done;
++	}
++	struct sync_file_info info = {0};
++	ret = (int)stub_ioctl(fence_fd, SYNC_IOC_FILE_INFO, &info);
++	if (ret < 0)
++		goto done;
++	if (info.status < 0) {
++		ret = info.status;
++		goto done;
++	}
++	struct {
++		uint32_t context;
++		int32_t fd;
++		uint64_t pre, post;
++	} params = { .context = cmd->fence_context_handle, .fd = fence_fd,
++		.pre = cmd->pre_wait_value, .post = cmd->post_wait_value };
++	ret = (int)stub_ioctl(render, NVKVM_SYNC_FILE_FENCE_WAIT, &params);
++done:
++	if (source >= 0)
++		stub_close(source); /* native WAIT owns its reference after registration */
++	if (ret < 0)
++		send_error(ret);
++	else
++		send_ok();
++}
++
+ static unsigned stub_drm_fd_count;
+ 
+ static void handle_open_device(struct isolate_cmd_open_device *cmd)
+@@ -2845,6 +2941,7 @@
+ 	struct isolate_cmd_mmap             mmap_cmd;
+ 	struct isolate_cmd_munmap           munmap_cmd;
+ 	struct isolate_cmd_export_sync_file export_sync_file;
++	struct isolate_cmd_import_sync_file import_sync_file;
+ 	struct isolate_cmd_poll             poll_cmd;
+ 	struct isolate_cmd_unpoll           unpoll_cmd;
+ 	struct isolate_cmd_open_device      open_dev;
+@@ -3298,6 +3395,9 @@
+ 		locked_send(&r, sizeof(r));
+ 		return 0;
+ 	}
++	case ISOLATE_CMD_IMPORT_SYNC_FILE:
++		handle_import_sync_file(&c->import_sync_file, msg_hdr, n);
++		return 0;
+ 	case ISOLATE_CMD_EXPORT_SYNC_FILE:
+ 		if (n != (long)sizeof(c->export_sync_file))
+ 			send_open_device_resp(0, -EINVAL, -1);

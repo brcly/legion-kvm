@@ -1,0 +1,108 @@
+--- a/src/qemu/nvkvm_present_egl.c
++++ b/src/qemu/nvkvm_present_egl.c
+@@ -360,7 +360,7 @@
+     GList *releases;
+     QEMUTimer *release_timer;
+     unsigned release_count;
+-    uint64_t release_gpu, release_dropped, release_errors;
++
+ 
+     uint32_t key;            /* guest scanout bo this frame came from */
+     uint32_t owner;          /* isolate that exported it (S-4) */
+@@ -635,6 +635,14 @@
+ /* Strict SDL mode: the source is reusable only after its last host GPU
+  * read completes. The queue also retains completed notifications while VQ_EVT
+  * is full. A device-owned timer retries; no delayed BH can outlive teardown. */
++static struct { uint64_t gpu, dropped, errors; } strict_releases;
++static bool strict_release_stats_registered;
++static void nvkvm_release_stats_dump(void)
++{
++    fprintf(stderr, "nvkvm strict releases: gpu=%" PRIu64 " unconsumed=%" PRIu64 " errors=%" PRIu64 "\n",
++            strict_releases.gpu, strict_releases.dropped, strict_releases.errors);
++}
++
+ typedef struct NvkvmGpuRelease {
+     uint32_t context, key;
+     int fd;
+@@ -654,10 +662,10 @@
+                 close(r->fd);
+                 r->fd = -1;
+                 r->ready = true;
+-                p->release_gpu++;
++                strict_releases.gpu++;
+             } else if (ret < 0 || info.status < 0) {
+                 r->failed = true;
+-                p->release_errors++;
++                strict_releases.errors++;
+                 error_report("nvkvm: host read fence failed; source buffer remains owned");
+             }
+         }
+@@ -679,7 +687,7 @@
+     }
+     if (p->release_count >= 128) {
+         if (fd >= 0) close(fd);
+-        p->release_errors++;
++        strict_releases.errors++;
+         error_report("nvkvm: host release queue full; source buffers remain owned");
+         return;
+     }
+@@ -690,7 +698,7 @@
+     r->ready = ready;
+     p->releases = g_list_prepend(p->releases, r);
+     p->release_count++;
+-    if (ready) p->release_dropped++;
++    if (ready) strict_releases.dropped++;
+     timer_mod(p->release_timer, qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 1);
+ }
+ 
+@@ -698,14 +706,14 @@
+ {
+     EGLDisplay display = eglGetCurrentDisplay();
+     if (display == EGL_NO_DISPLAY || !epoxy_has_egl_extension(display, "EGL_ANDROID_native_fence_sync")) {
+-        p->release_errors++;
++        strict_releases.errors++;
+         error_report("nvkvm: current display cannot export a GPU read fence; buffer remains owned");
+         return;
+     }
+     const EGLint attrs[] = { EGL_NONE };
+     EGLSyncKHR sync = eglCreateSyncKHR(display, EGL_SYNC_NATIVE_FENCE_ANDROID, attrs);
+     if (sync == EGL_NO_SYNC_KHR) {
+-        p->release_errors++;
++        strict_releases.errors++;
+         error_report("nvkvm: host GPU read fence creation failed; buffer remains owned");
+         return;
+     }
+@@ -713,7 +721,7 @@
+     int fd = eglDupNativeFenceFDANDROID(display, sync);
+     eglDestroySyncKHR(display, sync);
+     if (fd < 0) {
+-        p->release_errors++;
++        strict_releases.errors++;
+         error_report("nvkvm: host GPU read fence export failed; buffer remains owned");
+         return;
+     }
+@@ -1822,8 +1830,13 @@
+     p->mode = -1;
+     p->dev  = dev;
+     p->nv   = nv;
+-    if (nv->strict_scanout_release)
++    if (nv->strict_scanout_release) {
+         p->release_timer = timer_new_ms(QEMU_CLOCK_REALTIME, nvkvm_release_poll, p);
++        if (!strict_release_stats_registered) {
++            atexit(nvkvm_release_stats_dump);
++            strict_release_stats_registered = true;
++        }
++    }
+     p->con  = qemu_graphic_console_create(dev, 0, &nvkvm_present_hwops, p);
+     p->bh   = qemu_bh_new(nvkvm_present_bh, p);
+     qemu_sem_init(&p->wake, 0);   /* #125: present thread starts on first use */
+@@ -1863,8 +1876,7 @@
+             g_free(r);
+         }
+         g_list_free(p->releases);
+-        fprintf(stderr, "nvkvm strict releases: gpu=%" PRIu64 " unconsumed=%" PRIu64 " errors=%" PRIu64 "\n",
+-                p->release_gpu, p->release_dropped, p->release_errors);
++
+     }
+     /* #125: stop the present thread before tearing anything it touches down. */
+     if (p->thread_started) {

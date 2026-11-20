@@ -11,6 +11,8 @@ mod frame_timing;
 mod frame_transport;
 mod input_events;
 mod kms;
+mod kms_formats;
+mod kms_plane;
 mod native_acquire;
 mod native_amd;
 mod offscreen;

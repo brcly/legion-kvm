@@ -1,0 +1,38 @@
+--- a/src/guest/nvkvm_kms.c
++++ b/src/guest/nvkvm_kms.c
+@@ -30,6 +30,7 @@
+ #include <drm/drm_framebuffer.h>  /* #102 present path: fb geometry/format */
+ #include <linux/hrtimer.h>
+ #include <linux/ktime.h>
++#include <linux/math64.h>
+ 
+ #include "nvkvm.h"
+ 
+@@ -657,6 +658,7 @@
+ 	spin_lock_irqsave(&kms->pending_lock, flags);
+ 	w = kms->cur_w;
+ 	h = kms->cur_h;
++	hz = kms->host_hz ? kms->host_hz : nvkvm_kms_hz;
+ 	spin_unlock_irqrestore(&kms->pending_lock, flags);
+ 
+ 	/*
+@@ -665,6 +667,19 @@
+ 	 * so a list that ends at the current size is a head that can never grow.
+ 	 */
+ 	count = drm_add_modes_noedid(conn, nvkvm_kms_max_w, nvkvm_kms_max_h);
++	/* This virtual head has one host-paced timer for every resolution.
++	 * DMT's fixed 60/75 Hz clocks must not advertise a different cadence to
++	 * Wayland/Wine when the timer is actually running at (say) 240 Hz.
++	 * Scaling the dot clock preserves each mode's timing flags and totals.
++	 */
++	list_for_each_entry(mode, &conn->probed_modes, head) {
++		unsigned int old_hz = drm_mode_vrefresh(mode);
++
++		if (old_hz && old_hz != hz)
++			mode->clock = DIV_ROUND_CLOSEST_ULL((u64)mode->clock * hz,
++						       old_hz);
++	}
++
+ 
+ 	/*
+ 	 * AND THE ONE THAT ACTUALLY MATTERS, WHICH THAT CALL CANNOT PRODUCE.

@@ -1,0 +1,17 @@
+--- a/src/qemu/nvkvm_isolate_handlers.c
++++ b/src/qemu/nvkvm_isolate_handlers.c
+@@ -5310,10 +5310,14 @@
+ 	ret = nvkvm_isolate_export_sync_file(&nv->isolates, req->isolate_id,
+ 		req->handle_id, output, req->fence_context_handle,
+ 		req->timeout_ms, req->wait_value, &fd);
++	NVKVM_DBG("nvkvm sync_file export: isolate=%u render=%u context=%u wait=%llu ret=%d fd=%d\n",
++		req->isolate_id, req->handle_id, req->fence_context_handle,
++		(unsigned long long)req->wait_value, ret, fd);
+ 	bool exported = ret == 0;
+ 	if (!ret)
+ 		ret = nvkvm_handle_attach_sync_file(&nv->handles, output, fd);
+ 	if (ret < 0) {
++		NVKVM_DBG("nvkvm sync_file attach/export failed: %d\n", ret);
+ 		if (fd >= 0)
+ 			close(fd);
+ 		if (exported)

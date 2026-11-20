@@ -1,0 +1,30 @@
+[package]
+name = "legion-qemu-display-probe"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Separate research dependency graph; do not add a display experiment to the
+# packaged runtime or change its lockfile.
+[workspace]
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+async-channel = "2"
+async-io = "2"
+futures-lite = "2"
+libc = "0.2"
+serde_json = "1"
+qemu-display = { git = "https://gitlab.com/marcandre.lureau/qemu-display", rev = "2592a2316e29e9187d29b4883570da2fb501b202" }
+
+[build-dependencies]
+cc = "1"
+pkg-config = "0.3"
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
+unwrap_used = "deny"

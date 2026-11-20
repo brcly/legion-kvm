@@ -1,0 +1,46 @@
+--- a/src/common/nvkvm_nvkms_ops.h
++++ b/src/common/nvkvm_nvkms_ops.h
+@@ -77,6 +77,13 @@
+ 		o.known = 1; o.reg_surface = 17; o.unreg_surface = 18;
+ 		o.vblank_enable = 60; o.vblank_disable = 61; o.vblank_accel = 62;
+ 	}
++	/* Measured from OGKM 620.70.06 (e6a2e01579fb): CHECK_LUT_NOTIFIER
++	 * was removed, shifting surface and vblank command numbers down.
++	 * Restrict qualification to the measured major/minor family. */
++	if (major == 620 && minor == 70) {
++		o.known = 1; o.reg_surface = 16; o.unreg_surface = 17;
++		o.vblank_enable = 59; o.vblank_disable = 60; o.vblank_accel = 61;
++	}
+ 	return o;
+ }
+ 
+--- a/tests/unit/test_nvkms_allowlist.c
++++ b/tests/unit/test_nvkms_allowlist.c
+@@ -102,6 +102,7 @@
+ 	{ "595.91.07",  595,  91, 17, 18, 19, 60, 61, 62, 59 },
+ 	{ "610.43.02",  610,  43, 17, 18, 19, 60, 61, 62, 59 },
+ 	{ "610.57.04",  610,  57, 17, 18, 19, 60, 61, 62, 59 },
++	{ "620.70.06",  620,  70, 16, 17, 18, 59, 60, 61, 58 },
+ };
+ 
+ int main(void)
+@@ -177,7 +178,7 @@
+ 
+ 	/* An unknown or unparseable branch admits device alloc/free and nothing
+ 	 * else -- extrapolating the numbering is what let FLIPLOCK in. */
+-	unsigned unknown[] = { 0, 470, 514, 611, 700 };
++	unsigned unknown[] = { 0, 470, 514, 611, 620, 621, 700 };
+ 	for (unsigned i = 0; i < sizeof(unknown) / sizeof(unknown[0]); i++) {
+ 		unsigned m = unknown[i];
+ 		CHECK(nvkvm_nvkms_cmd_allowed_ver(0, m, 0),
+--- a/tests/unit/run_tests.sh
++++ b/tests/unit/run_tests.sh
+@@ -52,7 +52,7 @@
+     [test_objects]=20
+     [test_handle]=12
+     [test_tables]=17
+-    [test_nvkms_allowlist]=618
++    [test_nvkms_allowlist]=769
+     [test_stub_ptr_sanitize]=17
+     [test_kvm_slot]=12
+     [test_stub_window]=27

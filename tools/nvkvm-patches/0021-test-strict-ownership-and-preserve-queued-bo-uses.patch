@@ -1,0 +1,202 @@
+--- a/src/qemu/nvkvm_present_egl.c
++++ b/src/qemu/nvkvm_present_egl.c
+@@ -27,6 +27,7 @@
+ #include "ui/egl-helpers.h"
+ #include "ui/dmabuf.h"
+ #include "qapi/error.h"
++#include "qemu/error-report.h"
+ #include "qemu/main-loop.h"
+ #include "qemu/timer.h"
+ #include "hw/core/qdev.h"
+--- a/src/guest/nvkvm_kms.c
++++ b/src/guest/nvkvm_kms.c
+@@ -374,6 +374,7 @@
+ }
+ 
+ /* Remember that the host has been handed this bo.  pending_lock held. */
++/* NVKVM_SCANOUT_OWNERSHIP_BEGIN */
+ static struct nvkvm_bp_buffer *nvkvm_bp_find(struct nvkvm_kms *kms, u32 actor, u32 gem)
+ {
+ 	for (unsigned int i = 0; i < NVKVM_KMS_BP_SLOTS; i++)
+@@ -414,6 +415,24 @@
+ 		return;
+ 	*slot = (struct nvkvm_bp_buffer){0};
+ }
++
++/* A framebuffer object can change while referring to the same underlying
++ * BO. Replacing that queued description must preserve the new queued use. */
++static bool nvkvm_bp_drop_queued(struct nvkvm_kms *kms, u32 old_actor, u32 old_gem,
++    u32 new_actor, u32 new_gem)
++{
++	if (old_actor == new_actor && old_gem == new_gem)
++		return false;
++	struct nvkvm_bp_buffer *slot = nvkvm_bp_find(kms, old_actor, old_gem);
++	if (!slot)
++		return false;
++	slot->queued = false;
++	if (slot->held)
++		return false;
++	nvkvm_bp_untrack(kms, old_actor, old_gem);
++	return true;
++}
++/* NVKVM_SCANOUT_OWNERSHIP_END */
+ 
+ /*
+  * Detach the held flip event so the caller can deliver it.  pending_lock held;
+@@ -1059,7 +1078,7 @@
+ 	}
+ 	struct drm_pending_vblank_event *event = NULL;
+ 	struct nvkvm_fd_ctx *ctx = NULL;
+-	u32 gem = 0;
++	u32 gem = 0, queued_actor = 0, queued_gem = 0;
+ 	if (nvkvm.strict_scanout_release && nvkvm_fb_stub_handle(fb, &gem, &ctx)) {
+ 		struct nvkvm_bp_buffer *slot = nvkvm_bp_track(kms, ctx->handle_id, gem);
+ 		if (!slot) {
+@@ -1069,21 +1088,15 @@
+ 			return;
+ 		}
+ 		slot->queued = true;
++		queued_actor = ctx->handle_id;
++		queued_gem = gem;
+ 	}
+ 	old = kms->pending_fb;
+-	if (nvkvm.strict_scanout_release && old && old != fb &&
+-	    nvkvm_fb_stub_handle(old, &gem, &ctx)) {
+-		struct nvkvm_bp_buffer *slot = nvkvm_bp_find(kms, ctx->handle_id, gem);
+-		if (slot) {
+-			slot->queued = false;
+-			if (!slot->held) {
+-				nvkvm_bp_untrack(kms, ctx->handle_id, gem);
+-				if (kms->bp_event && kms->bp_wait_iso == ctx->handle_id &&
+-				    kms->bp_wait_gem == gem)
+-					event = nvkvm_bp_take_event(kms);
+-			}
+-		}
+-	}
++	if (nvkvm.strict_scanout_release && old &&
++	    nvkvm_fb_stub_handle(old, &gem, &ctx) &&
++	    nvkvm_bp_drop_queued(kms, ctx->handle_id, gem, queued_actor, queued_gem) &&
++	    kms->bp_event && kms->bp_wait_iso == ctx->handle_id && kms->bp_wait_gem == gem)
++		event = nvkvm_bp_take_event(kms);
+ 	kms->pending_fb = fb;
+ 	kms->n_queued++;
+ 	if (old)
+@@ -1142,6 +1155,12 @@
+ 		if (nvkvm_bp_hold(kms, old_state ? old_state->fb : NULL, fb,
+ 				  event))
+ 			return;
++		if (nvkvm.strict_scanout_release) {
++			/* The old source was already released or never consumed.
++			 * Do not add another software-vblank delay to that proof. */
++			nvkvm_bp_send(kms, event);
++			return;
++		}
+ 		spin_lock_irq(&crtc->dev->event_lock);
+ 		if (drm_crtc_vblank_get(crtc) == 0)
+ 			drm_crtc_arm_vblank_event(crtc, event);
+--- a/tests/unit/Makefile
++++ b/tests/unit/Makefile
+@@ -44,7 +44,7 @@
+ 
+ .PHONY: all clean run check
+ 
+-all: test_objects test_handle mock_stub test_isolate test_tables test_open_scm test_ctrl_gate test_nvkms_allowlist test_stub_ptr_sanitize test_kvm_slot test_stub_window test_drm_devinfo test_r1_type_dev test_transport_ready test_relay_state test_relay_clip test_relay_wiring test_relay_bufmap test_uidmap
++all: test_scanout_ownership test_objects test_handle mock_stub test_isolate test_tables test_open_scm test_ctrl_gate test_nvkms_allowlist test_stub_ptr_sanitize test_kvm_slot test_stub_window test_drm_devinfo test_r1_type_dev test_transport_ready test_relay_state test_relay_clip test_relay_wiring test_relay_bufmap test_uidmap
+ 
+ test_objects: $(OBJECTS_SRCS)
+ 	$(CC) $(CFLAGS) -o $@ $(OBJECTS_SRCS) $(LDFLAGS)
+@@ -257,3 +257,13 @@
+ 	      relay_clip_wiring.inc relay_writable_wiring.inc relay_connect_wiring.inc \
+ 	      relay_bufmap.inc
+ 	rm -f test_dispatch test_frontend test_handle mock_stub test_isolate test_tables test_open_scm test_ctrl_gate test_nvkms_allowlist test_stub_ptr_sanitize stub_sanitize.inc test_transport_ready transport_ready.inc test_relay_state relay_state_helpers.inc test_relay_clip relay_clip_batch.inc test_relay_wiring relay_fd_ownership.inc relay_clip_wiring.inc relay_writable_wiring.inc relay_connect_wiring.inc
++
++# Strict scanout uses real GPU completion, not bounded pacing hints.
++kms_ownership_types.inc: ../../src/guest/nvkvm_kms.c
++	awk '/^#define NVKVM_KMS_BP_SLOTS/ {print} /^struct nvkvm_bp_buffer {/,/^};/' $< > $@
++
++kms_ownership.inc: ../../src/guest/nvkvm_kms.c
++	awk '/NVKVM_SCANOUT_OWNERSHIP_BEGIN/,/NVKVM_SCANOUT_OWNERSHIP_END/' $< > $@
++
++test_scanout_ownership: test_scanout_ownership.c kms_ownership_types.inc kms_ownership.inc
++	$(CC) $(CFLAGS) -I. -o $@ $<
+--- a/tests/unit/run_tests.sh
++++ b/tests/unit/run_tests.sh
+@@ -68,6 +68,7 @@
+ # Suites with their own ad-hoc output.  Value is a line that must appear.
+ declare -A MARKER_SUITES=(
+     [test_uidmap]="test_uidmap passed"
++    [test_scanout_ownership]="scanout ownership passed"
+     [test_open_scm]="ALL OPEN_SCM TESTS PASSED"
+     [test_ctrl_gate]="test_ctrl_gate: PASS"
+ )
+--- /dev/null
++++ b/tests/unit/test_scanout_ownership.c
+@@ -0,0 +1,68 @@
++/* Exercise production ownership helpers, extracted from nvkvm_kms.c. */
++#include <assert.h>
++#include <stdbool.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <string.h>
++typedef uint32_t u32;
++#include "kms_ownership_types.inc"
++struct nvkvm_kms {
++    struct nvkvm_bp_buffer bp_inflight[NVKVM_KMS_BP_SLOTS];
++    unsigned int bp_next;
++};
++static struct { bool strict_scanout_release; } nvkvm;
++#include "kms_ownership.inc"
++
++int main(void)
++{
++    struct nvkvm_kms kms = {0};
++    nvkvm.strict_scanout_release = true;
++    struct nvkvm_bp_buffer *first = nvkvm_bp_track(&kms, 10, 1);
++    assert(first);
++    first->queued = first->held = true;
++    /* A host release cannot remove a separately queued use of that BO. */
++    nvkvm_bp_untrack(&kms, 10, 1);
++    assert(nvkvm_bp_find(&kms, 10, 1) == first && first->queued && !first->held);
++    /* Updating the framebuffer description for the same BO is not a drop. */
++    assert(!nvkvm_bp_drop_queued(&kms, 10, 1, 10, 1));
++    assert(first->queued);
++    /* A queued frame that was never consumed can safely be coalesced away. */
++    assert(nvkvm_bp_drop_queued(&kms, 10, 1, 10, 2));
++    assert(!nvkvm_bp_find(&kms, 10, 1));
++
++    first = nvkvm_bp_track(&kms, 10, 1);
++    first->queued = first->held = true;
++    assert(!nvkvm_bp_drop_queued(&kms, 10, 1, 10, 2));
++    assert(first->held && !first->queued);
++    nvkvm_bp_untrack(&kms, 10, 1);
++    assert(!nvkvm_bp_find(&kms, 10, 1));
++
++    /* GEM IDs are file-local, including within one isolate. */
++    first = nvkvm_bp_track(&kms, 20, 1);
++    struct nvkvm_bp_buffer *second = nvkvm_bp_track(&kms, 21, 1);
++    assert(first && second && first != second);
++    first->held = second->held = true;
++    nvkvm_bp_untrack(&kms, 20, 1);
++    assert(nvkvm_bp_find(&kms, 21, 1) == second && second->held);
++    nvkvm_bp_untrack(&kms, 20, 1); /* duplicate old release */
++    assert(second->held);
++
++    memset(&kms, 0, sizeof(kms));
++    for (unsigned int i = 0; i < NVKVM_KMS_BP_SLOTS; i++) {
++        struct nvkvm_bp_buffer *slot = nvkvm_bp_track(&kms, 30, i + 1);
++        assert(slot);
++        slot->held = true;
++    }
++    /* Allocation pressure must never forget a live reader. */
++    assert(!nvkvm_bp_track(&kms, 30, NVKVM_KMS_BP_SLOTS + 1));
++    for (unsigned int i = 0; i < NVKVM_KMS_BP_SLOTS; i++)
++        assert(nvkvm_bp_find(&kms, 30, i + 1)->held);
++    nvkvm_bp_untrack(&kms, 30, 1);
++    assert(nvkvm_bp_track(&kms, 30, NVKVM_KMS_BP_SLOTS + 1));
++
++    /* Preserve the legacy bounded-hint eviction policy outside strict mode. */
++    nvkvm.strict_scanout_release = false;
++    assert(nvkvm_bp_track(&kms, 40, 100));
++    puts("scanout ownership passed");
++    return 0;
++}

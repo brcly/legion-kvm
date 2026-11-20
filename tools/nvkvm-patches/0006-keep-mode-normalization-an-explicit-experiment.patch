@@ -1,0 +1,40 @@
+--- a/src/guest/nvkvm_kms.c
++++ b/src/guest/nvkvm_kms.c
+@@ -93,6 +93,7 @@
+ static unsigned int nvkvm_kms_w  = NVKVM_KMS_W_DEFAULT;
+ static unsigned int nvkvm_kms_h  = NVKVM_KMS_H_DEFAULT;
+ static unsigned int nvkvm_kms_hz = NVKVM_KMS_HZ_DEFAULT;
++static bool nvkvm_kms_normalize_refresh;
+ static unsigned int nvkvm_kms_max_w = NVKVM_KMS_MAX_W_DEFAULT;
+ static unsigned int nvkvm_kms_max_h = NVKVM_KMS_MAX_H_DEFAULT;
+ 
+@@ -167,6 +168,8 @@
+ MODULE_PARM_DESC(kms_height, "virtual head height in pixels (default 1080)");
+ module_param_named(kms_hz, nvkvm_kms_hz, uint, 0444);
+ MODULE_PARM_DESC(kms_hz, "virtual head refresh rate in Hz (default 60)");
++module_param_named(kms_normalize_refresh, nvkvm_kms_normalize_refresh, bool, 0444);
++MODULE_PARM_DESC(kms_normalize_refresh, "research: report host pacing for every mode (default off)");
+ 
+ /*
+  * present_stats=N -- report the present counters every N flips.  0 disables.
+@@ -672,12 +675,14 @@
+ 	 * Wayland/Wine when the timer is actually running at (say) 240 Hz.
+ 	 * Scaling the dot clock preserves each mode's timing flags and totals.
+ 	 */
+-	list_for_each_entry(mode, &conn->probed_modes, head) {
+-		unsigned int old_hz = drm_mode_vrefresh(mode);
+-
+-		if (old_hz && old_hz != hz)
+-			mode->clock = DIV_ROUND_CLOSEST_ULL((u64)mode->clock * hz,
+-						       old_hz);
++	if (nvkvm_kms_normalize_refresh) {
++		list_for_each_entry(mode, &conn->probed_modes, head) {
++			unsigned int old_hz = drm_mode_vrefresh(mode);
++	
++			if (old_hz && old_hz != hz)
++				mode->clock = DIV_ROUND_CLOSEST_ULL((u64)mode->clock * hz,
++							       old_hz);
++		}
+ 	}
+ 
+ 

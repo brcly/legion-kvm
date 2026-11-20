@@ -1,0 +1,92 @@
+--- a/include/ui/console.h
++++ b/include/ui/console.h
+@@ -342,6 +342,8 @@
+     void (*text_update)(void *opaque, uint32_t *text);
+     void (*ui_info)(void *opaque, uint32_t head, QemuUIInfo *info);
+     void (*gl_block)(void *opaque, bool block);
++    /* Private research viewer contract, successful GPU reads only. */
++    void (*gl_read_complete)(void *opaque, bool success);
+ } GraphicHwOps;
+ 
+ QemuConsole *qemu_graphic_console_create(DeviceState *dev, uint32_t head,
+@@ -357,6 +359,7 @@
+ void qemu_console_hw_invalidate(QemuConsole *con);
+ void qemu_console_hw_text_update(QemuConsole *con, uint32_t *chardata);
+ void qemu_console_hw_gl_block(QemuConsole *con, bool block);
++void qemu_console_gl_read_complete(QemuConsole *con, bool success);
+ 
+ void qemu_console_early_init(void);
+ 
+--- a/ui/console.c
++++ b/ui/console.c
+@@ -181,6 +181,12 @@
+     warn_report("console: no gl-unblock within one second");
+ }
+ 
++void qemu_console_gl_read_complete(QemuConsole *con, bool success)
++{
++    if (con->hw_ops->gl_read_complete)
++        con->hw_ops->gl_read_complete(con->hw, success);
++}
++
+ void qemu_console_hw_gl_block(QemuConsole *con, bool block)
+ {
+     uint64_t timeout;
+--- a/ui/dbus-listener.c
++++ b/ui/dbus-listener.c
+@@ -88,6 +88,8 @@
+     QemuDBusDisplay1ListenerUnixScanoutDMABUF2 *scanout_dmabuf_v2_proxy;
+ #endif
+ 
++    QemuDmaBuf *legion_scanout;
++    bool legion_read_completion;
+     guint dbus_filter;
+     guint32 display_serial_to_discard;
+     guint32 cursor_serial_to_discard;
+@@ -119,6 +121,7 @@
+ {
+     DBusDisplayListener *ddl = container_of(dcl, DBusDisplayListener, dcl);
+ 
++    ddl->legion_scanout = NULL;
+     ddl_discard_display_messages(ddl);
+ 
+     qemu_dbus_display1_listener_call_disable(
+@@ -241,6 +244,8 @@
+     }
+ #endif
+ 
++    if (ddl->legion_read_completion)
++        qemu_console_gl_read_complete(ddl->dcl.con, success);
+     qemu_console_hw_gl_block(ddl->dcl.con, false);
+     g_object_unref(ddl);
+ }
+@@ -400,6 +405,7 @@
+ {
+     DBusDisplayListener *ddl = container_of(dcl, DBusDisplayListener, dcl);
+ 
++    ddl->legion_scanout = dmabuf;
+     if (ddl->scanout_dmabuf_v2_proxy) {
+         dbus_scanout_dmabuf_v2(ddl, dmabuf);
+     } else {
+@@ -686,7 +692,9 @@
+ static void dbus_release_dmabuf(DisplayChangeListener *dcl,
+                                 QemuDmaBuf *dmabuf)
+ {
+-    dbus_scanout_disable(dcl);
++    DBusDisplayListener *ddl = container_of(dcl, DBusDisplayListener, dcl);
++    if (ddl->legion_scanout == dmabuf)
++        dbus_scanout_disable(dcl);
+ }
+ #endif /* GBM */
+ 
+@@ -1268,6 +1276,10 @@
+     ddl->conn = conn;
+     ddl->console = console;
+ 
++    ddl->legion_read_completion = dbus_display_listener_implements(
++        ddl, "org.legion.Display1.Listener.ReadCompletion");
++    if (ddl->legion_read_completion)
++        info_report("LEGION_DBUS_READ_COMPLETION negotiated=1");
+     dbus_display_listener_setup_shared_map(ddl);
+     trace_dbus_can_share_map(ddl->can_share_map);
+     dbus_display_listener_setup_d3d11(ddl);

@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use legion_display_channel::Input;
 use smithay::{
     backend::{
@@ -151,6 +151,11 @@ impl State {
     pub(crate) fn pending_sync_acquires(&self) -> usize {
         self.acquire_watches.len()
     }
+    pub(crate) fn acquire_watch_fds(&self) -> impl Iterator<Item = std::os::fd::BorrowedFd<'_>> {
+        self.acquire_watches
+            .iter()
+            .map(crate::syncobj::Watch::as_fd)
+    }
     pub fn close_clients(&self) {
         for surface in self.xdg.toplevel_surfaces() {
             surface.send_close();
@@ -183,6 +188,18 @@ impl State {
         height: u32,
     ) -> Result<Self> {
         Self::with_formats(dh, None, formats, dev, width, height)
+    }
+    pub fn set_output_refresh(&self, refresh_mhz: u32) -> Result<()> {
+        ensure!(
+            (1_000..=1_000_000).contains(&refresh_mhz),
+            "output refresh must be between 1 and 1000 Hz"
+        );
+        let mut mode = self._output.current_mode().context("output has no mode")?;
+        mode.refresh = i32::try_from(refresh_mhz)?;
+        self._output
+            .change_current_state(Some(mode), None, None, None);
+        self._output.set_preferred(mode);
+        Ok(())
     }
     pub(crate) fn with_formats(
         dh: &DisplayHandle,

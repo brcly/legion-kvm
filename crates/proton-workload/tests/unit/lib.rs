@@ -131,3 +131,64 @@ fn retirement_control_requires_command_stage_timing() {
         .command_stage_probe = true;
     assert!(config.valid());
 }
+
+#[test]
+fn source_frame_tags_require_runtime_feedback_and_input_mode() {
+    let mut config: Config = serde_json::from_str(r#"{"schema":1,"width":1920,"height":1080,"warmup_ms":200,"sample_ms":1000,"cpu_rounds":25000,"gpu_clears":1,"presentation":{"seconds":25,"frame_tags":true}}"#).expect("frame tag configuration");
+    assert!(!config.valid());
+    let settings = config.presentation.as_mut().expect("presentation");
+    settings.latency_probe = true;
+    assert!(!config.valid());
+    config
+        .presentation
+        .as_mut()
+        .expect("presentation")
+        .runtime_feedback = true;
+    assert!(config.valid());
+}
+
+#[test]
+fn repeated_resize_configuration_is_bounded_and_requires_resize_mode() {
+    let mut value = serde_json::json!({"schema":1,"width":1920,"height":1080,
+        "warmup_ms":200,"sample_ms":1000,"cpu_rounds":25000,"gpu_clears":1,"presentation":{"seconds":30,"resize":true,"resize_cycles":48}});
+    let valid: Config =
+        serde_json::from_value(value.clone()).expect("bounded stress configuration");
+    assert!(valid.valid());
+    for cycles in [0, 49, u32::MAX] {
+        value["presentation"]["resize_cycles"] = cycles.into();
+        let invalid: Config = serde_json::from_value(value.clone()).expect("numeric configuration");
+        assert!(!invalid.valid());
+    }
+    value["presentation"]["resize_cycles"] = 2.into();
+    value["presentation"]["resize"] = false.into();
+    let invalid: Config = serde_json::from_value(value).expect("numeric configuration");
+    assert!(!invalid.valid());
+}
+
+#[test]
+fn long_shader_load_is_confined_to_bounded_latency_diagnostics() {
+    let mut config: Config = serde_json::from_str(r#"{"schema":1,"width":1920,"height":1080,"warmup_ms":200,"sample_ms":1000,"cpu_rounds":25000,"gpu_clears":1,"presentation":{"seconds":25,"latency_probe":true,"fragment_iterations":65536}}"#).expect("explicit long-shader diagnostic");
+    assert!(config.valid());
+    config
+        .presentation
+        .as_mut()
+        .expect("presentation")
+        .fragment_iterations = 65537;
+    assert!(!config.valid());
+    let settings = config.presentation.as_mut().expect("presentation");
+    settings.fragment_iterations = 65536;
+    settings.latency_probe = false;
+    assert!(!config.valid());
+}
+
+#[test]
+fn runtime_feedback_requires_the_explicit_input_reactive_fixture() {
+    let mut config: Config = serde_json::from_str(r#"{"schema":1,"width":1920,"height":1080,"warmup_ms":200,"sample_ms":1000,"cpu_rounds":25000,"gpu_clears":1,"presentation":{"seconds":25,"runtime_feedback":true}}"#).expect("feedback configuration");
+    assert!(!config.valid());
+    config
+        .presentation
+        .as_mut()
+        .expect("presentation")
+        .latency_probe = true;
+    assert!(config.valid());
+}

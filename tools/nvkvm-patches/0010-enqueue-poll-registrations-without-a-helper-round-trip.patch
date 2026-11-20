@@ -1,0 +1,184 @@
+--- a/src/common/nvkvm_isolate_proto.h
++++ b/src/common/nvkvm_isolate_proto.h
+@@ -45,6 +45,8 @@
+ #define ISOLATE_CMD_MMAP         4   /* fd + gva + len + prot + flags+offset */
+ #define ISOLATE_CMD_MUNMAP       5   /* gva + len                            */
+ #define ISOLATE_CMD_POLL         6   /* fd + events; start background poll   */
++/* Internal QEMU/stub command flag: registration has no separate OK reply. */
++#define ISOLATE_POLL_NOACK (1u << 31)
+ #define ISOLATE_CMD_UNPOLL       7   /* fd; stop background poll             */
+ #define ISOLATE_CMD_EXIT         8   /* clean shutdown                       */
+ #define ISOLATE_CMD_OPEN_DEVICE  9   /* stub opens /dev/nvidia*, replies w/ SCM_RIGHTS fd */
+--- a/src/stub/nvkvm_stub.c
++++ b/src/stub/nvkvm_stub.c
+@@ -3268,7 +3268,8 @@
+ 		/* #127: arm the host os-event fd; the reader loop ppoll()s it and
+ 		 * sends ISOLATE_RESP_POLL_EVENT when it fires. */
+ 		poll_arm(c->poll_cmd.handle_id);
+-		send_ok();
++		if (!(c->poll_cmd.events & ISOLATE_POLL_NOACK))
++			send_ok();
+ 		return 0;
+ 	case ISOLATE_CMD_UNPOLL:
+ 		poll_disarm(c->unpoll_cmd.handle_id);
+--- a/src/qemu/nvkvm_isolate.h
++++ b/src/qemu/nvkvm_isolate.h
+@@ -599,6 +599,12 @@
+ int nvkvm_isolate_poll(struct nvkvm_isolate_table *t,
+ 		       uint32_t isolate_id, uint32_t handle_id,
+ 		       uint32_t events);
++/* Enqueue a one-shot arm without waiting for a registration acknowledgement.
++ * Completion still arrives through the ordinary POLL_EVENT response. */
++int nvkvm_isolate_poll_enqueue(struct nvkvm_isolate_table *t,
++                              uint32_t isolate_id, uint32_t handle_id,
++                              uint32_t events);
++
+ int nvkvm_isolate_unpoll(struct nvkvm_isolate_table *t,
+ 			 uint32_t isolate_id, uint32_t handle_id);
+ 
+--- a/src/qemu/nvkvm_isolate.c
++++ b/src/qemu/nvkvm_isolate.c
+@@ -3784,19 +3784,54 @@
+ 	return sync_send_recv(iso, &cmd, sizeof(cmd));
+ }
+ 
+-int nvkvm_isolate_unpoll(struct nvkvm_isolate_table *t,
+-			 uint32_t isolate_id, uint32_t handle_id)
++int nvkvm_isolate_poll_enqueue(struct nvkvm_isolate_table *t,
++                              uint32_t isolate_id, uint32_t handle_id,
++                              uint32_t events)
+ {
+ 	if (isolate_id == 0 || isolate_id >= NVKVM_ISOLATE_MAX)
+ 		return -ENOENT;
+-	struct nvkvm_isolate *iso = &t->isolates[isolate_id % NVKVM_ISOLATE_MAX];
+-
++	struct nvkvm_isolate *iso = &t->isolates[isolate_id];
+ 	pthread_mutex_lock(&iso->lock);
+ 	bool valid = iso->in_use && iso->id == isolate_id && iso->alive;
+ 	pthread_mutex_unlock(&iso->lock);
+ 	if (!valid)
+ 		return -ENOENT;
+ 
++	struct isolate_cmd_poll cmd = {
++		.type = ISOLATE_CMD_POLL,
++		.handle_id = handle_id,
++		.events = events | ISOLATE_POLL_NOACK,
++	};
++	/* SEQPACKET preserves ordering with close/unpoll and all other command
++	 * writers. Do not occupy the BQL waiting for the helper to read this.
++	 * The socket queue bounds outstanding arms; backpressure is reported to
++	 * the guest, which resets poll_armed on error exactly as in sync mode.
++	 * write_lock pins this fd against kill()/descriptor reuse during send. */
++	pthread_mutex_lock(&iso->write_lock);
++	int fd = iso->sock_fd;
++	ssize_t sent;
++	do {
++		sent = fd < 0 ? -1 : send(fd, &cmd, sizeof(cmd), MSG_NOSIGNAL | MSG_DONTWAIT);
++	} while (fd >= 0 && sent < 0 && errno == EINTR);
++	int result = fd < 0 ? -EPIPE : sent < 0 ? -errno :
++		     sent == sizeof(cmd) ? 0 : -EIO;
++	pthread_mutex_unlock(&iso->write_lock);
++	return result;
++}
++
++int nvkvm_isolate_unpoll(struct nvkvm_isolate_table *t,
++			 uint32_t isolate_id, uint32_t handle_id)
++{
++	if (isolate_id == 0 || isolate_id >= NVKVM_ISOLATE_MAX)
++		return -ENOENT;
++	struct nvkvm_isolate *iso = &t->isolates[isolate_id % NVKVM_ISOLATE_MAX];
++
++	pthread_mutex_lock(&iso->lock);
++	bool valid = iso->in_use && iso->id == isolate_id && iso->alive;
++	pthread_mutex_unlock(&iso->lock);
++	if (!valid)
++		return -ENOENT;
++
+ 	struct isolate_cmd_unpoll cmd = {
+ 		.type      = ISOLATE_CMD_UNPOLL,
+ 		.handle_id = handle_id,
+--- a/src/qemu/nvkvm_isolate_handlers.c
++++ b/src/qemu/nvkvm_isolate_handlers.c
+@@ -5294,10 +5294,16 @@
+ 		resp->status = EPERM;
+ 		return 0;
+ 	}
+-	int ret = nvkvm_isolate_poll(&nv->isolates,
+-				     req->isolate_id,
+-				     req->handle_id,
+-				     req->events);
++	/* VQ handlers run under the BQL; initialize this opt-in policy once. */
++	static int enqueue = -1;
++	if (enqueue < 0) {
++		const char *value = getenv("NVKVM_POLL_ENQUEUE");
++		enqueue = value && !strcmp(value, "1");
++	}
++	int ret = enqueue ? nvkvm_isolate_poll_enqueue(&nv->isolates,
++				 req->isolate_id, req->handle_id, req->events) :
++			    nvkvm_isolate_poll(&nv->isolates,
++				 req->isolate_id, req->handle_id, req->events);
+ 	resp->status = (ret < 0) ? (uint32_t)-ret : 0;
+ 	return 0;
+ }
+--- a/tests/unit/mock_stub.c
++++ b/tests/unit/mock_stub.c
+@@ -70,9 +70,13 @@
+ 		case ISOLATE_CMD_RECEIVE_FD:
+ 		case ISOLATE_CMD_CLOSE_FD:
+ 		case ISOLATE_CMD_MUNMAP:
+-		case ISOLATE_CMD_POLL:
+ 		case ISOLATE_CMD_UNPOLL:
+ 			send_ok(sock);
++			break;
++
++		case ISOLATE_CMD_POLL:
++			if (!(u.poll.events & ISOLATE_POLL_NOACK))
++				send_ok(sock);
+ 			break;
+ 
+ 		case ISOLATE_CMD_MMAP: {
+--- a/tests/unit/test_isolate.c
++++ b/tests/unit/test_isolate.c
+@@ -337,6 +337,23 @@
+ }
+ 
+ /* ── Test 7: poll / unpoll ───────────────────────────────────────────────── */
++
++TEST(poll_enqueue)
++{
++	fixture_init();
++	uint32_t iso_id = 0;
++	EXPECT_EQ(nvkvm_isolate_create(&g_it, 19, NULL, &iso_id), 0);
++	EXPECT_EQ(nvkvm_isolate_poll_enqueue(&g_it, 0, 1, POLLIN), -ENOENT);
++	for (unsigned i = 0; i < 128; i++) {
++		EXPECT_EQ(nvkvm_isolate_poll_enqueue(&g_it, iso_id, 1, POLLIN), 0);
++		/* The mock sends no reply for the enqueue. A following synchronous
++		 * command must still receive its own response, without deadlock. */
++		EXPECT_EQ(nvkvm_isolate_unpoll(&g_it, iso_id, 1), 0);
++	}
++	EXPECT_EQ(nvkvm_isolate_kill(&g_it, iso_id), 0);
++	EXPECT_EQ(nvkvm_isolate_poll_enqueue(&g_it, iso_id, 1, POLLIN), -ENOENT);
++	fixture_fini();
++}
+ 
+ TEST(poll_unpoll)
+ {
+@@ -499,6 +516,7 @@
+ 	RUN(kill_during_inflight);
+ 	RUN(sync_mmap_munmap);
+ 	RUN(poll_unpoll);
++	RUN(poll_enqueue);
+ 	RUN(foreign_relay_cleanup_on_kill);
+ 	RUN(nvkms_vblank_quota_lifecycle);
+ 
+--- a/tests/unit/run_tests.sh
++++ b/tests/unit/run_tests.sh
+@@ -111,7 +111,7 @@
+ # So the "isolate reports itself not-alive, and its stub sees EOF right after
+ # exec" symptom had a mundane cause: QEMU had closed its own end of the socket,
+ # by hand, one instruction before it needed it.
+-ISOLATE_TOTAL=9
++ISOLATE_TOTAL=10
+ ISOLATE_KNOWN_FAIL=""
+ 
+ # Cases that legitimately differ BY ENVIRONMENT, and so cannot be pinned either

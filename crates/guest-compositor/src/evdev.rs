@@ -1,4 +1,4 @@
-//! Input from this VM's virtual keyboard and tablet, never host input devices.
+//! Input from this VM's virtual keyboard, tablet and mouse.
 use anyhow::{Context, Result, ensure};
 use legion_display_channel::input_events::{Batch, Event, TimedEvent};
 use std::{
@@ -44,9 +44,25 @@ fn axis(file: &File, code: u8) -> Result<Option<Axis>> {
     }))
 }
 
+fn relative_axes(file: &File) -> Result<bool> {
+    let request = rustix::ioctl::opcode::read::<[u8; 8]>(b'E', 0x22);
+    let mut bits = [0_u8; 8];
+    // SAFETY: EVIOCGBIT(EV_REL, 8) writes at most this live eight-byte bitmap.
+    if unsafe { libc::ioctl(file.as_raw_fd(), request as _, bits.as_mut_ptr()) } < 0 {
+        let error = io::Error::last_os_error();
+        if matches!(error.raw_os_error(), Some(libc::EINVAL | libc::ENOTTY)) {
+            return Ok(false);
+        }
+        return Err(error).context("query virtual relative axes");
+    }
+    Ok(bits[0] & 3 == 3)
+}
+
 #[derive(Default)]
 struct Decoder {
     absolute: Option<[Axis; 2]>,
+    relative_supported: bool,
+    relative: [i64; 2],
     dirty: bool,
     dropped: bool,
 }
@@ -61,12 +77,23 @@ impl Decoder {
             });
         }
         self.dirty = false;
+        if self.relative != [0, 0] {
+            let [dx, dy] = self.relative.map(|value| value as f64);
+            events.push(Event::Relative {
+                dx,
+                dy,
+                raw_dx: dx,
+                raw_dy: dy,
+            });
+            self.relative = [0, 0];
+        }
     }
     fn event(&mut self, kind: u16, code: u16, value: i32, events: &mut Vec<Event>) {
         if kind == 0 && code == 3 {
             // SYN_DROPPED: do not retain stuck keys.
             events.push(Event::Reset);
             self.dirty = false;
+            self.relative = [0, 0];
             self.dropped = true;
             return;
         }
@@ -83,6 +110,10 @@ impl Decoder {
                     axes[usize::from(code)].value = value;
                     self.dirty = true;
                 }
+            }
+            (2, 0..=1) if self.relative_supported => {
+                let axis = &mut self.relative[usize::from(code)];
+                *axis = axis.saturating_add(i64::from(value));
             }
             (1, _) if value == 0 || value == 1 => {
                 self.flush(events);
@@ -115,10 +146,12 @@ impl Decoder {
 struct Device {
     file: File,
     decoder: Decoder,
+    relative_samples: u64,
 }
 pub(crate) struct Input {
     devices: Vec<Device>,
     started: bool,
+    relative_supported: bool,
 }
 impl Input {
     pub(crate) fn open() -> Result<Self> {
@@ -137,19 +170,35 @@ impl Input {
                     .open(entry.path())
                     .context("open guest virtual input device")?;
                 let absolute = axis(&file, 0)?.zip(axis(&file, 1)?).map(|(x, y)| [x, y]);
+                let relative_supported = relative_axes(&file)?;
                 devices.push(Device {
                     file,
+                    relative_samples: 0,
                     decoder: Decoder {
                         absolute,
+                        relative_supported,
                         ..Default::default()
                     },
                 });
             }
         }
+        let relative_supported = devices
+            .iter()
+            .any(|device| device.decoder.relative_supported);
         Ok(Self {
             devices,
             started: false,
+            relative_supported,
         })
+    }
+    pub(crate) fn relative_supported(&self) -> bool {
+        self.relative_supported
+    }
+    pub(crate) fn diagnostics(&self) -> serde_json::Value {
+        serde_json::json!({"devices": self.devices.iter().map(|device|
+            serde_json::json!({"relative_supported":device.decoder.relative_supported,
+                               "relative_samples":device.relative_samples})
+        ).collect::<Vec<_>>()})
     }
     pub(crate) fn poll(&mut self, width: u32, height: u32, now_us: u64) -> Result<Batch> {
         let mut events = Vec::new();
@@ -178,6 +227,9 @@ impl Input {
                         let code = u16::from_ne_bytes([bytes[18], bytes[19]]);
                         let value =
                             i32::from_ne_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]);
+                        if kind == 2 && code <= 1 {
+                            device.relative_samples += 1;
+                        }
                         device.decoder.event(kind, code, value, &mut events);
                     }
                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
@@ -189,6 +241,7 @@ impl Input {
         Ok(Batch {
             width,
             height,
+            relative_supported: self.relative_supported,
             events: events
                 .into_iter()
                 .map(|event| TimedEvent {

@@ -1,0 +1,13 @@
+--- a/src/guest/nvkvm_sync_file.c
++++ b/src/guest/nvkvm_sync_file.c
+@@ -85,7 +85,9 @@
+ 		int ret = nvkvm_virtio_sync_file_status(ctx, &status);
+ 		if (!ret && (status == 1 || (status < 0 && status >= -MAX_ERRNO)))
+ 			break;
+-		wait_event_timeout(ctx->poll_wq,
++		/* nvkvm_evt_deliver uses wake_up_interruptible(). Match its
++		 * task state or every completion waits for the watchdog. */
++		wait_event_interruptible_timeout(ctx->poll_wq,
+ 			atomic_xchg(&ctx->poll_events, 0), msecs_to_jiffies(10));
+ 	}
+ 	if (status < 0)

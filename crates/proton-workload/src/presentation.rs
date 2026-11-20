@@ -6,16 +6,45 @@ pub struct PresentationConfig {
     pub seconds: u32,
     #[serde(default)]
     pub resize: bool,
+    #[serde(default = "one", skip_serializing_if = "is_one")]
+    pub resize_cycles: u32,
     #[serde(default, skip_serializing_if = "crate::is_false")]
     pub stage_probe: bool,
     #[serde(default, skip_serializing_if = "is_zero")]
     pub fragment_iterations: u32,
     #[serde(default, skip_serializing_if = "is_zero")]
     pub cpu_rounds: u32,
+    #[serde(default, skip_serializing_if = "crate::is_false")]
+    pub latency_probe: bool,
+    #[serde(default, skip_serializing_if = "crate::is_false")]
+    pub runtime_feedback: bool,
+    #[serde(default, skip_serializing_if = "crate::is_false")]
+    pub frame_tags: bool,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub latency_delay_ms: u32,
+}
+
+fn one() -> u32 {
+    1
+}
+fn is_one(value: &u32) -> bool {
+    *value == 1
 }
 
 fn is_zero(value: &u32) -> bool {
     *value == 0
+}
+
+/// Pixel of the input-reactive barcode. The fixed high word distinguishes the
+/// owned fixture from boot surfaces, placeholders and unrelated images.
+pub fn presentation_latency_pixel(x: u32, width: u32, sequence: u32, load_bit: u8) -> [u8; 4] {
+    tag_pixel(x, width, 0xa5c3_0000 | (sequence & 0xffff), load_bit)
+}
+
+fn tag_pixel(x: u32, width: u32, word: u32, load_bit: u8) -> [u8; 4] {
+    let bit = (u64::from(x) * 32 / u64::from(width.max(1))).min(31) as u32;
+    let color = if word & (1 << bit) != 0 { 230 } else { 20 } + (load_bit & 1);
+    [color, color, color, 255]
 }
 
 // Affine exponentiation computes the shader's wrapping recurrence without repeating thousands of GPU iterations for every CPU reference pixel.
@@ -123,7 +152,9 @@ pub fn verify_presentation_load(
         return None;
     }
     let mut hash = 0xcbf2_9ce4_8422_2325_u64;
-    let transform = load_transform(iterations);
+    let latency = iterations & (1 << 31) != 0;
+    let rounds = iterations & 0x3fff_ffff;
+    let transform = load_transform(rounds);
     for y in 0..height {
         for (x, pixel) in bytes[y as usize * pitch..y as usize * pitch + row]
             .as_chunks::<4>()
@@ -131,10 +162,23 @@ pub fn verify_presentation_load(
             .iter()
             .enumerate()
         {
-            let mut expected = presentation_pixel(x as u32, y, width, seed);
-            if iterations != 0 {
+            let load_bit = if rounds != 0 {
+                (load_seed(x as u32, y, width, seed, transform) & 1) as u8
+            } else {
+                0
+            };
+            let mut expected = if latency {
+                if iterations & (1 << 30) != 0 && y < 16 {
+                    tag_pixel(x as u32, width, 0xb7d1_0000 | (seed >> 16), load_bit)
+                } else {
+                    presentation_latency_pixel(x as u32, width, seed, load_bit)
+                }
+            } else {
+                presentation_pixel(x as u32, y, width, seed)
+            };
+            if !latency && rounds != 0 {
                 let channel = if x as u32 >= width / 2 { 0 } else { 2 };
-                expected[channel] += (load_seed(x as u32, y, width, seed, transform) & 1) as u8;
+                expected[channel] += load_bit;
             }
             if *pixel != expected {
                 return None;

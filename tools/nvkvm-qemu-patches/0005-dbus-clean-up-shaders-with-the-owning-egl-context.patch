@@ -1,0 +1,17 @@
+--- a/ui/dbus.c
++++ b/ui/dbus.c
+@@ -162,7 +162,13 @@
+     g_free(dd->dbus_addr);
+     g_free(dd->audiodev);
+ #ifdef CONFIG_OPENGL
+-    g_clear_pointer(&dd->glctx.gls, qemu_gl_fini_shader);
++    /* Other display/device teardown may have left no current context. These
++     * shaders were created in the render-node context: restore that context
++     * before issuing GL deletes, just as normal rendering does. */
++    if (dd->glctx.gls &&
++        qemu_egl_make_context_current(&dd->glctx, qemu_egl_rn_ctx) == 0) {
++        g_clear_pointer(&dd->glctx.gls, qemu_gl_fini_shader);
++    }
+ #endif
+     dbus_display = NULL;
+ }

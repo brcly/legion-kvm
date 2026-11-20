@@ -1,0 +1,72 @@
+--- a/src/qemu/nvkvm_ctrl_allowlist.h
++++ b/src/qemu/nvkvm_ctrl_allowlist.h
+@@ -134,6 +134,7 @@
+ 	0x00fd0104u,
+ 	0x00fd0105u,
+ 	0x00fe0101u, /* NV_MEMORY_MAPPER: inline operations; validated below. */
++	0x00fe0102u, /* RESIZE_QUEUE: one bounded inline count. */
+ 	0x20800102u,
+ 	0x20800110u,
+ 	0x20800111u,
+@@ -402,6 +403,13 @@
+  * and inline semaphore values. Refuse malformed counts/types before RM. */
+ static inline int nvkvm_ctrl_params_valid(uint32_t cmd, const void *aux, uint32_t size)
+ {
++    if (cmd == 0x00fe0102u) {
++        if (!aux || size != 4u) return 0;
++        const uint8_t *p = aux;
++        uint32_t count = (uint32_t)p[0] | (uint32_t)p[1] << 8 |
++                         (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
++        return count > 0u && count <= 65536u;
++    }
+     if (cmd != 0x00fe0101u) return 1;
+     if (!aux || size != 229392u) return 0;
+     const uint8_t *p = aux;
+--- a/src/qemu/nvkvm_isolate_handlers.c
++++ b/src/qemu/nvkvm_isolate_handlers.c
+@@ -3805,10 +3805,15 @@
+ 			resp->fault_addr = 0;
+ 			return 0;
+ 		}
++        if (cc_readable && cc == 0x00fe0102u && aux_buf && req->aux_size == 4) {
++            uint32_t count;
++            memcpy(&count, aux_buf, sizeof(count));
++            fprintf(stderr, "nvkvm: memory mapper resize queue=%u (limit 65536)\n", count);
++        }
+ 		int cc_how = cc_readable ? nvkvm_ctrl_cmd_allowed(cc) : 0;
+ 		if (!cc_readable || !cc_how || req->aux_size > (1u << 20) ||
+             !nvkvm_ctrl_params_valid(cc, aux_buf, req->aux_size) ||
+-            (cc == 0x00fe0101u &&
++            ((cc == 0x00fe0101u || cc == 0x00fe0102u) &&
+              (req->param_size != sizeof(struct nvos54_parameters) ||
+               ((struct nvos54_parameters *)param_buf)->params_size != req->aux_size))) {
+ 			nvkvm_ctrl_deny_log(cc);
+--- a/src/stub/nvkvm_stub.c
++++ b/src/stub/nvkvm_stub.c
+@@ -2925,7 +2925,7 @@
+ 	 * way RM reports it. */
+ 	uint32_t inner;
+ 	__builtin_memcpy(&inner, (const uint8_t *)param + 8, sizeof(inner));
+-	if (inner == 0x00fe0101u || !nvkvm_ctrl_cmd_allowed(inner))
++	if (inner == 0x00fe0101u || inner == 0x00fe0102u || !nvkvm_ctrl_cmd_allowed(inner))
+ 		return 1;
+ 
+ 	if (aux_size == 0)
+--- a/tests/unit/test_ctrl_gate.c
++++ b/tests/unit/test_ctrl_gate.c
+@@ -133,6 +133,15 @@
+     assert(!nvkvm_ctrl_params_valid(0x00fe0101u, bulk, sizeof(bulk)));
+     bulk[8] = 4;
+     assert(nvkvm_ctrl_params_valid(0x00fe0101u, bulk, sizeof(bulk)));
++    uint32_t queue_size = 65536;
++    assert(nvkvm_ctrl_cmd_allowed(0x00fe0102u));
++    assert(nvkvm_ctrl_params_valid(0x00fe0102u, &queue_size, 4));
++    queue_size++;
++    assert(!nvkvm_ctrl_params_valid(0x00fe0102u, &queue_size, 4));
++    queue_size = 0;
++    assert(!nvkvm_ctrl_params_valid(0x00fe0102u, &queue_size, 4));
++    assert(!nvkvm_ctrl_params_valid(0x00fe0102u, &queue_size, 3));
++    assert(!nvkvm_ctrl_params_valid(0x00fe0102u, NULL, 4));
+ 	printf("test_ctrl_gate: PASS\n");
+ 	return 0;
+ }
